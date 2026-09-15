@@ -2,7 +2,7 @@
   "name": "sav-convert",
   "version": "1.0.0",
   "description": "Convert QSP .sav files between the classic 5.7.0 format and modern libqsp 5.9",
-  "license": "MIT",
+  "license": "MIT-0",
   "main": "lib/index.js",
   "files": ["lib", "convert.js", "reverse.js", "worker.js", "index.html", "README.md", "LICENSE"],
   "bin": {

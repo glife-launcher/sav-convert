@@ -211,4 +211,4 @@ files and no player saves belong in this repository.
 ## Provenance and licence
 
 Extracted from the Girl Life Launcher project, where this code ships inside the
-launcher's webview. MIT, see `LICENSE`.
+launcher's webview. MIT-0 (no attribution required), see `LICENSE`.
