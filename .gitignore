@@ -1,0 +1,5 @@
+# No game files and no player saves in this repository, ever.
+*.sav
+*.qsp
+node_modules/
+.DS_Store
