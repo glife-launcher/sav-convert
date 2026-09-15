@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QSP save converter</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --fg: #1d1d1b; --panel: #fff; --line: #d6d6d0;
+    --accent: #2f6f4f; --bad: #8c2f2f; --muted: #5d5d57;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17181a; --fg: #e8e8e4; --panel: #202225; --line: #35373b;
+            --accent: #6fbf95; --bad: #e08a8a; --muted: #9a9a94; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--fg);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 680px; margin: 0 auto; }
+  h1 { font-size: 21px; margin: 0 0 4px; }
+  p.lede { margin: 0 0 22px; color: var(--muted); }
+  .drop { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 12px; }
+  .drop.over { border-color: var(--accent); }
+  .drop h2 { font-size: 14px; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+  .drop .hint { color: var(--muted); font-size: 13px; margin: 0 0 8px; }
+  .picked { font-size: 13px; margin-top: 8px; word-break: break-all; }
+  #direction { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+               padding: 12px 16px; margin: 16px 0; font-size: 14px; }
+  #direction strong { color: var(--accent); }
+  label.opt { display: block; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  button { font: inherit; padding: 10px 20px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--accent); color: #fff; cursor: pointer; }
+  button[disabled] { opacity: .45; cursor: default; }
+  #msg { margin-top: 18px; white-space: pre-wrap; }
+  #msg.bad { color: var(--bad); }
+  #out a { color: var(--accent); font-weight: 600; }
+  #report { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  #report table { border-collapse: collapse; }
+  #report td { padding: 1px 12px 1px 0; vertical-align: top; }
+  footer { margin-top: 34px; font-size: 13px; color: var(--muted); }
+  input[type=file] { font: inherit; font-size: 13px; max-width: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <h1>QSP save converter</h1>
+  <p class="lede">Converts a QSP <code>.sav</code> file between the classic 5.7.0 format
+    (old desktop players) and the modern libqsp 5.9 format (qspider and players built on it),
+    in whichever direction the save itself needs. Everything runs in this page &mdash;
+    nothing is uploaded anywhere.</p>
+
+  <section class="drop" id="drop-sav">
+    <h2>1. The save file</h2>
+    <p class="hint">Drop a <code>.sav</code> here, or pick it.</p>
+    <input type="file" id="sav" accept=".sav">
+    <div class="picked" id="sav-picked"></div>
+  </section>
+
+  <section class="drop" id="drop-qsp">
+    <h2>2. The game file</h2>
+    <p class="hint">The <code>.qsp</code> the save belongs to. It is needed to check that the
+      save's location still exists in the game and to stamp the game's checksum. It is read,
+      never changed.</p>
+    <input type="file" id="qsp" accept=".qsp">
+    <div class="picked" id="qsp-picked"></div>
+  </section>
+
+  <div id="direction">Pick a save file to see which way it will be converted.</div>
+
+  <button id="go" disabled>Convert</button>
+
+  <div id="msg"></div>
+  <div id="out"></div>
+  <div id="report"></div>
+
+  <footer>Open this page straight from disk or from any static host; it needs no server and
+    makes no network requests. Extracted from the Girl Life Launcher project.</footer>
+</main>
+
+<script id="gl-core">
+/*GL_CORE*/
+</script>
+
+<script id="gl-worker-tail" type="text/plain">
+// Worker tail. The core above is concatenated ahead of this block into one
+// Blob, so the worker holds exactly the code the page holds.
+self.onmessage = function (e) {
+  var m = e.data || {};
+  try {
+    var api = self.GLSavConvert;
+    var req = { savBytes: m.savBytes, qspBytes: m.qspBytes, qspName: m.qspName };
+    var out;
+    if (m.op === 'reverse') {
+      req.locationAs = m.locationAs;
+      out = api.reverseConvertBuffer(req);
+    } else {
+      out = api.convertBuffer(req);
+    }
+    var buf = out.outBytes.buffer.byteLength === out.outBytes.byteLength
+      ? out.outBytes.buffer : out.outBytes.slice().buffer;
+    self.postMessage({ ok: true, bytes: buf, report: out.report }, [buf]);
+  } catch (err) {
+    // An Error subclass does not survive a structured clone: send the sentence
+    // and the kind as plain data.
+    self.postMessage({
+      ok: false,
+      kind: (err && err.kind) || 'error',
+      error: (err && err.message) || String(err)
+    });
+  }
+};
+</script>
+
+<script>
+(function () {
+  'use strict';
+  var api = window.GLSavConvert;
+  var savFile = null, savBytes = null, qspFile = null;
+  var dir = null;                 // 'forward' | 'reverse'
+  var lastUrl = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var elDir = $('direction'), elMsg = $('msg'), elOut = $('out'),
+      elRep = $('report'), elGo = $('go');
+
+  // Which lead-in a refusal gets, by the core's own `kind`. Same wording the
+  // command line prints; a stack trace is never shown.
+  var LEAD = {
+    'sav-format': 'This is not a save this converter can read',
+    'convert': 'This save cannot be converted',
+    'already-modern': 'Nothing to do',
+    'already-legacy': 'Nothing to do',
+    'game-file': 'That game file cannot be read'
+  };
+
+  function say(text, bad) {
+    elMsg.textContent = text || '';
+    elMsg.className = bad ? 'bad' : '';
+  }
+  function clearResult() {
+    elOut.textContent = '';
+    elRep.textContent = '';
+    if (lastUrl) { URL.revokeObjectURL(lastUrl); lastUrl = null; }
+  }
+  function kb(n) { return (n / 1024).toFixed(1) + ' KB'; }
+
+  function describe() {
+    clearResult();
+    if (!savBytes) {
+      elDir.textContent = 'Pick a save file to see which way it will be converted.';
+      elGo.disabled = true;
+      return;
+    }
+    var stamp = api.readEngineStamp(savBytes);
+    if (stamp === null) {
+      dir = null;
+      elDir.textContent = 'That file is not a QSP save — it has no "QSPSAVEDGAME" header.';
+      elGo.disabled = true;
+      return;
+    }
+    dir = api.compareVersions(stamp, api.MODERN_VER) >= 0 ? 'reverse' : 'forward';
+    var html = dir === 'forward'
+      ? 'This save was written by engine <strong>' + stamp + '</strong> (classic). ' +
+        'It will be converted to the <strong>modern</strong> format.'
+      : 'This save was written by engine <strong>' + stamp + '</strong> (modern). ' +
+        'It will be converted to the <strong>classic 5.7.0</strong> format.';
+    elDir.innerHTML = html;
+    if (dir === 'reverse') {
+      var lab = document.createElement('label');
+      lab.className = 'opt';
+      lab.innerHTML = '<input type="checkbox" id="locidx"> The classic player is a stock ' +
+        'QSP 5.7.0 player, which reads the location as a number. Leave this off for Qqsp 1.9.';
+      elDir.appendChild(lab);
+    }
+    elGo.disabled = !qspFile;
+  }
+
+  function pickSav(file) {
+    savFile = file; savBytes = null;
+    $('sav-picked').textContent = file ? file.name + '  (' + kb(file.size) + ')' : '';
+    say('');
+    if (!file) { describe(); return; }
+    file.arrayBuffer().then(function (buf) {
+      savBytes = new Uint8Array(buf);
+      describe();
+    }).catch(function () {
+      say('That save file could not be read from disk.', true);
+    });
+  }
+  function pickQsp(file) {
+    qspFile = file;
+    $('qsp-picked').textContent = file
+      ? file.name + '  (' + (file.size / 1048576).toFixed(1) + ' MB)' : '';
+    elGo.disabled = !(savBytes && dir && qspFile);
+  }
+
+  function wire(boxId, inputId, onFile, ext) {
+    var box = $(boxId), input = $(inputId);
+    input.addEventListener('change', function () { onFile(input.files[0] || null); });
+    box.addEventListener('dragover', function (e) { e.preventDefault(); box.classList.add('over'); });
+    box.addEventListener('dragleave', function () { box.classList.remove('over'); });
+    box.addEventListener('drop', function (e) {
+      e.preventDefault();
+      box.classList.remove('over');
+      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+      if (ext && f.name.toLowerCase().slice(-ext.length) !== ext) {
+        say('That does not look like a ' + ext + ' file.', true);
+        return;
+      }
+      onFile(f);
+    });
+  }
+  wire('drop-sav', 'sav', pickSav, '.sav');
+  wire('drop-qsp', 'qsp', pickQsp, '.qsp');
+
+  /** Build a worker out of the same core the page runs. Null if it cannot. */
+  function makeWorker() {
+    try {
+      var src = document.getElementById('gl-core').textContent + '\n' +
+        document.getElementById('gl-worker-tail').textContent;
+      var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      var w = new Worker(url);
+      URL.revokeObjectURL(url);
+      return w;
+    } catch (e) {
+      // Not every browser will start a worker from a blob: URL, and a page
+      // opened straight from disk has an opaque origin some of them refuse
+      // outright. The page then does the work itself: slower, and it freezes
+      // for a moment, but a player who keeps their save beats a dead button.
+      return null;
+    }
+  }
+
+  function finish(bytes, report, where) {
+    var base = savFile.name.replace(/\.sav$/i, '');
+    var name = base + (dir === 'forward' ? '-modern.sav' : '-classic.sav');
+    lastUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    var a = document.createElement('a');
+    a.href = lastUrl;
+    a.download = name;
+    a.id = 'download';
+    a.textContent = 'Download ' + name;
+    elOut.appendChild(a);
+    say('Converted ' + kb(report.inputBytes) + ' → ' + kb(report.outputBytes) +
+      '  (' + where + ').');
+    var rows = [
+      ['engine stamp', report.engineVersionIn + ' → ' + report.engineVersionOut],
+      ['location', report.location],
+      ['game checksum', report.qstCRCIn + ' → ' + report.qstCRCOut],
+      ['contents', report.variables + ' variables, ' + report.actions + ' actions, ' +
+        report.objects + ' objects']
+    ];
+    if (report.mods && report.mods.length) rows.push(['mods named in the save', report.mods.join(', ')]);
+    if (report.notes && report.notes.length) rows.push(['notes', report.notes.join('\n')]);
+    var t = document.createElement('table');
+    rows.forEach(function (r) {
+      var tr = t.insertRow();
+      tr.insertCell().textContent = r[0];
+      tr.insertCell().textContent = r[1];
+    });
+    elRep.appendChild(t);
+    elGo.disabled = false;
+  }
+
+  function fail(kind, message) {
+    clearResult();
+    say((LEAD[kind] || 'Conversion failed') + ':\n' + message, true);
+    elGo.disabled = false;
+  }
+
+  elGo.addEventListener('click', function () {
+    if (!savBytes || !qspFile || !dir) return;
+    clearResult();
+    elGo.disabled = true;
+    say('Reading the game file …');
+    var locBox = document.getElementById('locidx');
+    var locationAs = (dir === 'reverse' && locBox && locBox.checked) ? 'index' : 'name';
+
+    qspFile.arrayBuffer().then(function (qspBuf) {
+      say('Converting …');
+      var w = makeWorker();
+      var req = {
+        op: dir === 'reverse' ? 'reverse' : 'convert',
+        savBytes: savBytes.buffer.slice(0),
+        qspBytes: qspBuf,
+        qspName: qspFile.name,
+        locationAs: locationAs
+      };
+      if (w) {
+        window.__glPath = 'worker';
+        w.onmessage = function (e) {
+          var m = e.data || {};
+          w.terminate();
+          if (m.ok) finish(new Uint8Array(m.bytes), m.report, 'in a background worker');
+          else fail(m.kind, m.error);
+        };
+        w.onerror = function () {
+          w.terminate();
+          fail('error', 'The background worker stopped before it finished. ' +
+            'Reload the page and try again.');
+        };
+        w.postMessage(req, [req.savBytes, req.qspBytes]);
+      } else {
+        runHere(req);
+      }
+    }).catch(function () {
+      fail('game-file', 'The game file could not be read from disk.');
+    });
+  });
+
+  /** The main-thread fallback: the same core, called directly. */
+  function runHere(req) {
+    window.__glPath = 'main';
+    setTimeout(function () {
+      try {
+        var out = req.op === 'reverse' ? api.reverseConvertBuffer(req) : api.convertBuffer(req);
+        finish(out.outBytes, out.report, 'on the page');
+      } catch (err) {
+        fail((err && err.kind) || 'error', (err && err.message) || String(err));
+      }
+    }, 0);
+  }
+
+  describe();
+}());
+</script>
+</body>
+</html>

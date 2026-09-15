@@ -1,0 +1,2584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QSP save converter</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --fg: #1d1d1b; --panel: #fff; --line: #d6d6d0;
+    --accent: #2f6f4f; --bad: #8c2f2f; --muted: #5d5d57;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17181a; --fg: #e8e8e4; --panel: #202225; --line: #35373b;
+            --accent: #6fbf95; --bad: #e08a8a; --muted: #9a9a94; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--fg);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 680px; margin: 0 auto; }
+  h1 { font-size: 21px; margin: 0 0 4px; }
+  p.lede { margin: 0 0 22px; color: var(--muted); }
+  .drop { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 12px; }
+  .drop.over { border-color: var(--accent); }
+  .drop h2 { font-size: 14px; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+  .drop .hint { color: var(--muted); font-size: 13px; margin: 0 0 8px; }
+  .picked { font-size: 13px; margin-top: 8px; word-break: break-all; }
+  #direction { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+               padding: 12px 16px; margin: 16px 0; font-size: 14px; }
+  #direction strong { color: var(--accent); }
+  label.opt { display: block; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  button { font: inherit; padding: 10px 20px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--accent); color: #fff; cursor: pointer; }
+  button[disabled] { opacity: .45; cursor: default; }
+  #msg { margin-top: 18px; white-space: pre-wrap; }
+  #msg.bad { color: var(--bad); }
+  #out a { color: var(--accent); font-weight: 600; }
+  #report { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  #report table { border-collapse: collapse; }
+  #report td { padding: 1px 12px 1px 0; vertical-align: top; }
+  footer { margin-top: 34px; font-size: 13px; color: var(--muted); }
+  input[type=file] { font: inherit; font-size: 13px; max-width: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <h1>QSP save converter</h1>
+  <p class="lede">Converts a QSP <code>.sav</code> file between the classic 5.7.0 format
+    (old desktop players) and the modern libqsp 5.9 format (qspider and players built on it),
+    in whichever direction the save itself needs. Everything runs in this page &mdash;
+    nothing is uploaded anywhere.</p>
+
+  <section class="drop" id="drop-sav">
+    <h2>1. The save file</h2>
+    <p class="hint">Drop a <code>.sav</code> here, or pick it.</p>
+    <input type="file" id="sav" accept=".sav">
+    <div class="picked" id="sav-picked"></div>
+  </section>
+
+  <section class="drop" id="drop-qsp">
+    <h2>2. The game file</h2>
+    <p class="hint">The <code>.qsp</code> the save belongs to. It is needed to check that the
+      save's location still exists in the game and to stamp the game's checksum. It is read,
+      never changed.</p>
+    <input type="file" id="qsp" accept=".qsp">
+    <div class="picked" id="qsp-picked"></div>
+  </section>
+
+  <div id="direction">Pick a save file to see which way it will be converted.</div>
+
+  <button id="go" disabled>Convert</button>
+
+  <div id="msg"></div>
+  <div id="out"></div>
+  <div id="report"></div>
+
+  <footer>Open this page straight from disk or from any static host; it needs no server and
+    makes no network requests. Extracted from the Girl Life Launcher project.</footer>
+</main>
+
+<script id="gl-core">
+// QSP wire primitives shared by the legacy reader and the modern writer.
+//
+// Every rule here is transcribed from engine source, not inferred:
+//   * modern libqsp @ 9f4f29f9 (the commit launcher/engine-patch builds on)
+//     - qsp/coding.c  qspEncodeString / qspDecodeString / qspStringToFileData
+//     - qsp/text.h:23 QSP_STRSDELIM = "\r\n"
+//     - qsp/coding.h:24 QSP_CODREMOV = 5
+//     - qsp/game.c:83  qspCRC (NOTE the ARITHMETIC right shift — `crc` is int)
+//     - qsp/variables.c:113-115 the bucket hash
+//   * qsp-legacy 5.7.0 @ 16b85ac — src/coding.c qspCodeReCode, same ±5 shift
+//     and the same CRLF delimiter, so the container is identical either way.
+//
+// This file is part of the BYTE-LEVEL CORE and must run unchanged in node and
+// in the webview, so it uses `Uint8Array` and nothing else — no `Buffer`, no
+// `fs`, no node built-ins. Two consequences worth stating:
+//
+//   * the UTF-16 codec is hand written rather than a `TextDecoder`. A `.sav`
+//     body is ±5-SHIFTED text, so any code unit can appear, lone surrogates
+//     included; `TextDecoder('utf-16le')` replaces those with U+FFFD, while
+//     `Buffer.toString('utf16le')` (what the reference outputs were produced
+//     with) passes them through. Byte-identity with those reference outputs
+//     depends on the pass-through behaviour, so it is reproduced by hand.
+//   * the single-byte branch is a raw byte <-> code-unit map (what
+//     `latin1` means), NOT `windows-1252`, which is what the WHATWG label
+//     "latin1" actually selects. The point is a byte-for-byte round trip
+//     without knowing the game's codepage — see the README's caveat about
+//     non-ASCII variable names in a single-byte save.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.codec = factory();
+  }
+}(function () {
+  'use strict';
+
+  var CODREMOV = 5;
+  var NEG_CODREMOV = (-CODREMOV) & 0xffff;
+  var VARSBUCKETS = 1024;          // libqsp variables.h:26
+  var VARSMAXBUCKETSIZE = 50;      // libqsp variables.h:27
+  var VARSSEEK = 50;               // qsp-legacy variables.h:24
+  var VARSCOUNT = 256 * VARSSEEK;  // qsp-legacy variables.h:25 (12800)
+
+  /** qspDecodeString: shift every code unit up by 5; -5 maps back to 5. */
+  function decode(s) {
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      out += String.fromCharCode(c === NEG_CODREMOV ? CODREMOV : (c + CODREMOV) & 0xffff);
+    }
+    return out;
+  }
+
+  /** qspEncodeString: shift every code unit down by 5; 5 maps to -5. */
+  function encode(s) {
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      out += String.fromCharCode(c === CODREMOV ? NEG_CODREMOV : (c - CODREMOV) & 0xffff);
+    }
+    return out;
+  }
+
+  /**
+   * qspPrepareStringToExecution (libqsp codetools.c:548-577), transcribed.
+   *
+   * The modern engine runs this over EVERY line of code before it hands the
+   * line to its statement splitter: uppercase everything that is not inside a
+   * `'`/`"` string literal or a `{...}` q-string. Statement keywords are then
+   * matched against an UPPERCASE table with a case-sensitive compare
+   * (codetools.c:30-34 `qspStatStringCompare` -> `qspStrsNComp`), so a line
+   * that skipped this step has no recognisable keywords at all.
+   *
+   * Why a converter needs it: an engine stores the action bodies of the live
+   * action list in a save, and it stores them ALREADY PREPARED. The classic
+   * 5.7 player does not prepare in place, so a classic save carries the game's
+   * original lower-case source text; the modern engine re-reads those lines
+   * with `qspInitLineOfCode` alone (game.c:541) and never prepares them. The
+   * result is that `gt 'somewhere'` restored from a classic save is not a GOTO
+   * at all — it is parsed as an expression to print, and raises "Unknown
+   * action!" at the quote. Preparing the lines at conversion time is exactly
+   * what the modern engine would have written itself.
+   *
+   * The case mapping: libqsp uses newlib's `towupper` (qsp/towupper.c), a 1:1
+   * code-point map that never expands one character into two. JS's per-unit
+   * `toUpperCase()` agrees with it on everything a QSP keyword or identifier
+   * can be made of, and the few places it would EXPAND (`ß` -> `SS`) are
+   * exactly the places `towupper` leaves alone — so an expansion is dropped
+   * and the original character kept. That also keeps the string length, and
+   * therefore the save's byte layout, predictable.
+   */
+  function prepareForExecution(line) {
+    var out = '';
+    var i = 0;
+    var n = line.length;
+    var quotsCount = 0;
+    while (i < n) {
+      var c = line.charAt(i);
+      if (c === '{') { out += c; i++; quotsCount++; continue; }
+      if (c === '}') { out += c; i++; if (quotsCount) quotsCount--; continue; }
+      if (c === "'" || c === '"') {
+        // Copy the literal verbatim, honouring the doubled-quote escape.
+        var quot = c;
+        out += c;
+        i++;
+        while (i < n) {
+          var d = line.charAt(i);
+          out += d;
+          i++;
+          if (d === quot) {
+            if (i >= n) break;
+            if (line.charAt(i) !== quot) break;
+            out += line.charAt(i);
+            i++;
+          }
+        }
+        continue;
+      }
+      if (quotsCount) { out += c; i++; continue; } // q-strings stay untouched
+      var up = c.toUpperCase();
+      out += (up.length === 1 ? up : c);
+      i++;
+    }
+    return out;
+  }
+
+  /**
+   * qspStrToNum, reduced to what save/game fields hold (a decimal integer,
+   * optionally signed). Anything else reads as 0, exactly like the engine's
+   * "not a number" path.
+   */
+  function toNum(decoded) {
+    var n = parseInt(decoded, 10);
+    return isNaN(n) ? 0 : n;
+  }
+
+  /**
+   * qspCRC (game.c:83). `crc` is a signed int there, so `crc >> 8` is an
+   * arithmetic shift — JS `>>` matches; `>>>` would give a different answer.
+   */
+  var CRC_TABLE = (function () {
+    var t = new Int32Array(256);
+    for (var i = 0; i < 256; i++) {
+      var c = i;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      t[i] = c | 0;
+    }
+    return t;
+  }());
+
+  function qspCRC(buf) {
+    var crc = 0;
+    for (var i = 0; i < buf.length; i++) {
+      crc = ((CRC_TABLE[(crc & 0xff) ^ buf[i]] ^ (crc >> 8)) ^ 0xd202ef8d) | 0;
+    }
+    return crc;
+  }
+
+  /**
+   * libqsp variables.c:113-115 — bucket = (7, then *31 + low byte of each code
+   * unit, unsigned 32-bit) % 1024. `(unsigned char)*pos` takes the LOW byte of
+   * the QSP_CHAR, so a non-ASCII name hashes on its low bytes; reproduced as-is.
+   */
+  function bucketOf(name) {
+    var b = 7 >>> 0;
+    for (var i = 0; i < name.length; i++) {
+      b = (Math.imul(b, 31) + (name.charCodeAt(i) & 0xff)) >>> 0;
+    }
+    return b % VARSBUCKETS;
+  }
+
+  /**
+   * qsp-legacy 5.7.0's variable hash, the OTHER end of `bucketOf`.
+   *
+   *   /* variables.c:161-165 *\/
+   *   bCode = 0;
+   *   for (i = 0; uName[i]; ++i)
+   *       bCode = qspRand8[bCode ^ QSP_MBTOSB(uName[i])];
+   *   var = qspVars + QSP_VARSSEEK * bCode;      // 50 slots per block
+   *
+   * `bCode` is an `unsigned char`, so the whole hash is a byte-wide walk
+   * through this substitution table; the result names a BLOCK of 50 slots in
+   * the one flat 12 800-entry array, and `qspVarReference` then LINEAR-PROBES
+   * forward from the first slot of that block. `QSP_MBTOSB` is `(a) % 256` in
+   * the _UNICODE build (bindings/default/qsp_default.h:37) — the low byte of
+   * the UTF-16 code unit, exactly like modern's `(unsigned char)*pos`.
+   *
+   * Two consequences the reverse writer lives by:
+   *   * the probe STOPS at the first empty slot in the block (it returns that
+   *     empty slot to the caller, variables.c:167-171), so a save must pack a
+   *     block's variables contiguously from `50 * bCode` or everything behind
+   *     the hole is unreachable;
+   *   * a block holds at most 50 variables — the engine's own
+   *     `QSP_ERR_TOOMANYVARS` (variables.c:182).
+   *
+   * The table below is qsp-legacy's `qspRand8` (variables.c:27-45) copied
+   * verbatim; it is a permutation of 0..255 (the values sum to 32640).
+   */
+  var RAND8 = [
+    12, 107, 53, 36, 133, 5, 43, 172, 50, 38, 243, 76, 143, 244, 142, 188,
+    236, 105, 77, 149, 119, 104, 195, 219, 194, 113, 31, 209, 20, 170, 10, 9,
+    13, 6, 211, 81, 233, 49, 54, 158, 157, 128, 37, 239, 226, 85, 238, 144,
+    90, 180, 231, 41, 4, 193, 103, 0, 212, 210, 117, 208, 248, 116, 132, 70,
+    200, 68, 230, 99, 61, 216, 156, 218, 7, 181, 57, 106, 167, 222, 80, 249,
+    102, 168, 189, 201, 25, 206, 125, 235, 228, 205, 253, 165, 33, 131, 163, 217,
+    151, 16, 191, 139, 213, 129, 65, 30, 110, 17, 78, 174, 87, 146, 196, 161,
+    63, 124, 74, 24, 35, 109, 59, 150, 175, 224, 79, 245, 126, 34, 183, 48,
+    89, 21, 71, 220, 225, 101, 166, 32, 27, 66, 204, 29, 148, 207, 202, 83,
+    154, 40, 135, 60, 140, 120, 45, 147, 141, 56, 3, 162, 221, 73, 98, 240,
+    223, 160, 242, 72, 114, 111, 127, 198, 115, 26, 118, 173, 11, 254, 130, 108,
+    186, 15, 58, 96, 18, 123, 51, 190, 159, 93, 1, 100, 182, 23, 215, 152,
+    2, 185, 75, 255, 171, 176, 91, 179, 22, 247, 203, 252, 197, 14, 82, 92,
+    232, 42, 134, 97, 199, 46, 229, 164, 250, 121, 39, 251, 192, 122, 138, 55,
+    178, 237, 169, 95, 187, 62, 69, 47, 84, 88, 44, 112, 64, 227, 86, 184,
+    234, 145, 52, 246, 136, 67, 153, 214, 137, 155, 8, 241, 94, 28, 177, 19
+  ];
+
+  /** Legacy block number (0-255) for an ALREADY-UPPERCASED, `$`-less name. */
+  function legacyBlockOf(name) {
+    var b = 0;
+    for (var i = 0; i < name.length; i++) {
+      b = RAND8[(b ^ (name.charCodeAt(i) & 0xff)) & 0xff];
+    }
+    return b;
+  }
+
+  // --- byte <-> string, the two container encodings -------------------------
+
+  /** Chunked so a long run never blows the argument limit of `apply`. */
+  function fromCharCodes(units) {
+    var CH = 0x8000;
+    if (units.length <= CH) return String.fromCharCode.apply(null, units);
+    var parts = [];
+    for (var i = 0; i < units.length; i += CH) {
+      parts.push(String.fromCharCode.apply(null, units.subarray(i, Math.min(i + CH, units.length))));
+    }
+    return parts.join('');
+  }
+
+  /**
+   * Decode `bytes[start, end)` as the container's text.
+   *
+   * UTF-16LE: whole code units only — an odd trailing byte is dropped, which
+   * is what `Buffer.toString('utf16le')` does and therefore what the reference
+   * outputs were produced against.
+   */
+  function decodeRange(bytes, ucs2, start, end) {
+    if (start === undefined) start = 0;
+    if (end === undefined) end = bytes.length;
+    if (end < start) end = start;
+    if (!ucs2) return fromCharCodes(bytes.subarray(start, end));
+    var n = (end - start) >> 1;
+    var units = new Uint16Array(n);
+    for (var i = 0; i < n; i++) {
+      var p = start + i * 2;
+      units[i] = bytes[p] | (bytes[p + 1] << 8);
+    }
+    return fromCharCodes(units);
+  }
+
+  /** True when the container is UTF-16LE, decided as both engines decide it. */
+  function isUcs2(bytes) {
+    return bytes.length >= 2 && bytes[1] === 0;
+  }
+
+  /**
+   * Container split. UTF-16LE is detected exactly as the engines do
+   * (game.c:493 / legacy game.c:497: byte 1 is 0x00), otherwise the game's
+   * single-byte codepage — kept as a raw byte map so a byte-for-byte
+   * round-trip is possible without knowing which codepage it was.
+   */
+  function readContainer(bytes) {
+    var ucs2 = isUcs2(bytes);
+    return { ucs2: ucs2, lines: decodeRange(bytes, ucs2, 0, bytes.length).split('\r\n') };
+  }
+
+  /** qspStringToFileData — no BOM, no terminator, just the code units. */
+  function writeContainer(lines, ucs2) {
+    var text = lines.join('\r\n');
+    var n = text.length;
+    var out;
+    if (ucs2) {
+      out = new Uint8Array(n * 2);
+      for (var i = 0; i < n; i++) {
+        var c = text.charCodeAt(i);
+        out[i * 2] = c & 0xff;
+        out[i * 2 + 1] = (c >>> 8) & 0xff;
+      }
+      return out;
+    }
+    out = new Uint8Array(n);
+    for (var j = 0; j < n; j++) out[j] = text.charCodeAt(j) & 0xff;
+    return out;
+  }
+
+  /**
+   * Accept anything byte-shaped the two hosts pass in — a node `Buffer` (which
+   * IS a Uint8Array), an `ArrayBuffer` from `fetch().arrayBuffer()`, or a typed
+   * array view — and return a plain `Uint8Array` over the same bytes.
+   */
+  function toBytes(input) {
+    if (input instanceof Uint8Array) return input;
+    if (typeof ArrayBuffer !== 'undefined' && input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (input && typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(input)) {
+      return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    }
+    return null;
+  }
+
+  return {
+    CODREMOV: CODREMOV,
+    VARSBUCKETS: VARSBUCKETS,
+    VARSMAXBUCKETSIZE: VARSMAXBUCKETSIZE,
+    VARSSEEK: VARSSEEK,
+    VARSCOUNT: VARSCOUNT,
+    decode: decode,
+    encode: encode,
+    prepareForExecution: prepareForExecution,
+    toNum: toNum,
+    qspCRC: qspCRC,
+    bucketOf: bucketOf,
+    legacyBlockOf: legacyBlockOf,
+    isUcs2: isUcs2,
+    decodeRange: decodeRange,
+    readContainer: readContainer,
+    writeContainer: writeContainer,
+    toBytes: toBytes,
+    fromCharCodes: fromCharCodes,
+  };
+}));
+
+// The converter's typed refusals.
+//
+// Every message a class here carries is written for a PLAYER to read, because
+// both front ends put it straight on screen: the CLI prints it, and the saves
+// window shows it verbatim on the row. `kind` is the machine-readable half —
+// it survives a `postMessage` out of a Web Worker, where an `Error` subclass
+// does not (structured clone flattens it to a plain Error).
+//
+//   sav-format     the input is not a save this converter can READ
+//   convert        it is, but it cannot be translated faithfully
+//   already-modern it does not need converting at all
+//   already-legacy the same, for the REVERSE direction (modern -> classic)
+//   game-file      the `.qsp` handed in is not a readable game file
+//
+// The first two class names (`SavFormatError`, `ConvertError`) are fixed: the
+// CLI's exit-message wording is keyed on them, and the adversarial test gate
+// asserts that wording. Renaming them breaks both.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.errors = factory();
+  }
+}(function () {
+  'use strict';
+
+  function ConverterError(message, kind) {
+    var e = Error.call(this, message);
+    this.message = e.message;
+    this.name = 'ConverterError';
+    this.kind = kind || 'convert';
+    if (Error.captureStackTrace) Error.captureStackTrace(this, ConverterError);
+    else this.stack = e.stack;
+  }
+  ConverterError.prototype = Object.create(Error.prototype);
+  ConverterError.prototype.constructor = ConverterError;
+
+  function subclass(name, kind) {
+    function Sub(message) {
+      ConverterError.call(this, message, kind);
+      this.name = name;
+    }
+    Sub.prototype = Object.create(ConverterError.prototype);
+    Sub.prototype.constructor = Sub;
+    return Sub;
+  }
+
+  var SavFormatError = subclass('SavFormatError', 'sav-format');
+  var ConvertError = subclass('ConvertError', 'convert');
+  var AlreadyModernError = subclass('AlreadyModernError', 'already-modern');
+  var AlreadyLegacyError = subclass('AlreadyLegacyError', 'already-legacy');
+  var GameFileError = subclass('GameFileError', 'game-file');
+
+  return {
+    ConverterError: ConverterError,
+    SavFormatError: SavFormatError,
+    ConvertError: ConvertError,
+    AlreadyModernError: AlreadyModernError,
+    AlreadyLegacyError: AlreadyLegacyError,
+    GameFileError: GameFileError,
+  };
+}));
+
+// Strict reader for a CLASSIC-desktop-player `.sav` (engine stamp 5.7.0).
+//
+// Layout transcribed from qsp-legacy 5.7.0 @ 16b85ac, `src/game.c:319`
+// (`qspSaveGameStatusToString`) and its reader at `:463`:
+//
+//   [0]  "QSPSAVEDGAME"      (not encoded)
+//   [1]  engine version      (not encoded)
+//   ...everything below is encoded (codec.decode)...
+//   [2]  qspQstCRC of the .qsp the save was made against
+//   [3]  qspGetTime()        [4] selected action   [5] selected object
+//   [6]  view path           [7] input text        [8] main description
+//   [9]  vars description    [10] CURRENT LOCATION [11..14] window flags
+//   [15] timer interval      [16] playlist count -> that many file names
+//   then: includes count -> names
+//   then: actions count -> per action
+//         Image, Desc, linesCount, (line, lineNum)*,
+//         Location, ActIndex, StartLine, IsManageLines      <- last two are
+//                                                              LEGACY-ONLY
+//   then: objects count -> per object: Image, Desc
+//   then: total variable count -> per variable
+//         hashSlot, Name, valsCount, (Num, Str)*, indsCount, (Index, Str)*
+//   then: one trailing empty line.
+//
+// FIELD 10 — INDEX OR NAME.  Stock qsp-legacy writes `qspCurLoc`, an ordinal
+// into the game's location table.  The player Girl Life actually ships with —
+// Qqsp 1.9 (`girl life/qqspWin32_1.9 newset version/`, whose `qqsp.ini` records
+// `lastGame=.../Girl Life 0.9.6.1.qsp`) — writes the location NAME there
+// instead, like modern libqsp does; every file in the legacy save corpus this
+// reader was built against carries a name.  Both spellings are accepted here
+// and the caller is told which one it got, because resolving an ordinal against
+// a DIFFERENT game version is guesswork and has to be flagged as such.
+//
+// The whole walk is strict: a count that does not fit, or a body that does not
+// end exactly on the trailing empty line, is an error. A converter that
+// guesses produces a save that loads and then behaves wrongly, which is worse
+// than refusing.
+//
+// Byte-level core — takes bytes (`Uint8Array`, a node `Buffer`, or an
+// `ArrayBuffer`), never a path.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'), require('./errors'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.legacySav = factory(ns.codec, ns.errors);
+  }
+}(function (codec, errors) {
+  'use strict';
+
+  var decode = codec.decode;
+  var SavFormatError = errors.SavFormatError;
+
+  function parseLegacySav(input) {
+    var buf = codec.toBytes(input);
+    if (!buf || buf.length < 4) {
+      throw new SavFormatError('the file is empty or far too small to be a QSP save');
+    }
+    var container = codec.readContainer(buf);
+    var ucs2 = container.ucs2;
+    var lines = container.lines;
+    if (lines[0] !== 'QSPSAVEDGAME') {
+      throw new SavFormatError('not a QSP save file — line 1 reads ' +
+        JSON.stringify(String(lines[0]).slice(0, 32)) + ', expected "QSPSAVEDGAME"');
+    }
+    var engineVersion = lines[1];
+    if (lines.length < 18) {
+      throw new SavFormatError('QSP save header, but only ' + lines.length +
+        ' lines — the file is truncated before the body');
+    }
+
+    var i = 0;
+    var raw = function () {
+      if (i >= lines.length) {
+        throw new SavFormatError('the save ends in the middle of its body — the file has ' +
+          lines.length + ' lines and is truncated');
+      }
+      return lines[i++];
+    };
+    var str = function () { return decode(raw()); };
+    var int = function (what) {
+      var at = i + 1;
+      var text = str();
+      if (!/^-?\d+$/.test(text)) {
+        throw new SavFormatError('expected ' + what + ' (a number) on line ' + at +
+          ', found ' + JSON.stringify(text.slice(0, 32)) + ' — this is not a 5.7.0 save body');
+      }
+      return parseInt(text, 10);
+    };
+    var count = function (what, max) {
+      var at = i + 1;
+      var n = int(what);
+      if (n < 0 || n > max) {
+        throw new SavFormatError(what + ' on line ' + at + ' reads ' + n +
+          ' — impossible for this file (limit ' + max + '); the save is corrupt');
+      }
+      return n;
+    };
+
+    i = 2;
+    var head = {
+      bytes: buf.length,
+      ucs2: ucs2,
+      lineCount: lines.length,
+      engineVersion: engineVersion,
+      qstCRC: int('the game CRC'),
+      gameTime: int('the game clock'),
+      selAction: int('the selected action'),
+      selObject: int('the selected object'),
+      viewPath: str(),
+      curInput: str(),
+      curDesc: str(),
+      curVars: str(),
+    };
+    var locField = str();
+    head.locationIsIndex = /^-?\d+$/.test(locField);
+    head.locationField = locField;
+    head.showActs = int('the actions-window flag');
+    head.showObjs = int('the objects-window flag');
+    head.showVars = int('the stats-window flag');
+    head.showInput = int('the input-window flag');
+    head.timerInterval = int('the timer interval');
+
+    var k, l, v;
+    var playlist = [];
+    var plCount = count('the playlist length', 500);
+    for (k = 0; k < plCount; k++) playlist.push(str());
+
+    var includes = [];
+    var incCount = count('the includes count', 100);
+    for (k = 0; k < incCount; k++) includes.push(str());
+
+    var actions = [];
+    var actsCount = count('the actions count', 50); // legacy actions.h QSP_MAXACTIONS
+    for (k = 0; k < actsCount; k++) {
+      var image = str();
+      var desc = str();
+      var linesCount = count('an action code length', lines.length);
+      var code = [];
+      for (l = 0; l < linesCount; l++) code.push([str(), int('an action line number')]);
+      actions.push({
+        image: image,
+        desc: desc,
+        code: code,
+        location: int('an action location'),
+        actIndex: int('an action source index'),
+        startLine: int('an action start line'),      // legacy-only
+        isManageLines: int('an action manage flag'), // legacy-only
+      });
+    }
+
+    var objects = [];
+    var objsCount = count('the objects count', 1000);
+    for (k = 0; k < objsCount; k++) objects.push({ image: str(), desc: str() });
+
+    var vars = [];
+    var varsCount = count('the variables count', 12800); // legacy variables.h QSP_VARSCOUNT
+    for (k = 0; k < varsCount; k++) {
+      var slot = int('a variable hash slot');
+      var name = str();
+      var valsCount = count('a variable value count', lines.length);
+      var values = [];
+      for (v = 0; v < valsCount; v++) values.push({ num: int('a variable number'), str: str() });
+      var indsCount = count('a variable index count', lines.length);
+      var indices = [];
+      for (v = 0; v < indsCount; v++) indices.push({ index: int('an array index'), key: str() });
+      vars.push({ slot: slot, name: name, values: values, indices: indices });
+    }
+
+    // legacy game.c:463 splits and walks exactly the way this function does; a
+    // save that does not land exactly on the trailing empty line is not a save
+    // this reader understands, and converting it would be guessing.
+    if (i !== lines.length - 1 || lines[lines.length - 1] !== '') {
+      throw new SavFormatError('the body does not end where a 5.7.0 save should ' +
+        '(stopped at line ' + i + ' of ' + lines.length + ') — the file is corrupt or ' +
+        'was written by a player this converter does not know');
+    }
+
+    return { header: head, playlist: playlist, includes: includes, actions: actions, objects: objects, vars: vars };
+  }
+
+  return { parseLegacySav: parseLegacySav, SavFormatError: SavFormatError };
+}));
+
+// Read the location-name table (and the CRC) out of a compiled `.qsp`.
+//
+// The converter needs this for three things:
+//   1. to prove the location a legacy save is standing in still EXISTS in the
+//      game the user is about to load it into,
+//   2. to resolve a location INDEX to a name, for saves written by a player
+//      that stores the ordinal rather than the name (stock qsp-legacy does),
+//   3. to stamp the modern save with the right `qspQstCRC` (game.c:197/266).
+//
+// Format (libqsp qsp/game.c:168-262 `qspCheckGame` / `qspOpenGame`), CRLF-
+// separated, every field after line 0 "encoded" (codec.decode):
+//   new format, line 0 == "QSPGAME" (game.h:26):
+//     [0] QSPGAME  [1] author/tool  [2] password  [3] locations count
+//     then per location: Name, Desc, OnVisitCode, actionsCount,
+//     then per action:   Image, Desc, OnPressCode
+//   old format, line 0 == a plain number: that number is the location count,
+//     the table starts at line 30 and every location has exactly 20 actions
+//     with 2 fields each (no Image).
+//
+// The file is ~90 MB, so lines are located by scanning for the delimiter in
+// the raw bytes and only the fields actually needed are DECODED — `skip()`
+// walks a line without ever building a string for it. That laziness is what
+// keeps the parse affordable in a webview, where there is no native
+// `Buffer.indexOf` / `Buffer.toString` to lean on.
+//
+// Byte-level core — takes the bytes, never a path. The file-reading wrapper
+// lives in the CLI (`tools/sav-convert/convert.js`).
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'), require('./errors'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.qspGame = factory(ns.codec, ns.errors);
+  }
+}(function (codec, errors) {
+  'use strict';
+
+  var decode = codec.decode;
+  var toNum = codec.toNum;
+  var qspCRC = codec.qspCRC;
+  var GameFileError = errors.GameFileError;
+
+  var MAXACTIONS = 512; // libqsp declarations.h QSP_MAXACTIONS; sanity bound only
+
+  /** Offset of the next CRLF at or after `from`, or -1. */
+  function findDelim(bytes, from, ucs2) {
+    var n = bytes.length;
+    var i;
+    if (ucs2) {
+      for (i = from; i + 3 < n; i++) {
+        if (bytes[i] === 0x0d && bytes[i + 1] === 0 && bytes[i + 2] === 0x0a && bytes[i + 3] === 0) {
+          return i;
+        }
+      }
+      return -1;
+    }
+    for (i = from; i + 1 < n; i++) {
+      if (bytes[i] === 0x0d && bytes[i + 1] === 0x0a) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Sequential line reader over the raw file bytes.
+   *   `next()` returns the raw (still encoded) text of the next line, or null
+   *            at end of data;
+   *   `skip()` consumes one line without decoding it, and returns false only
+   *            at end of data.
+   */
+  function lineCursor(bytes) {
+    var ucs2 = codec.isUcs2(bytes);
+    var delimLen = ucs2 ? 4 : 2;
+    var pos = 0;
+    var done = false;
+    // Returns [start, end) of the next line's payload, or null at end of data.
+    function advance() {
+      if (done) return null;
+      var at = pos;
+      // Keep searching until the hit is aligned to a code-unit boundary —
+      // the engines split on code units, not bytes.
+      for (;;) {
+        at = findDelim(bytes, at, ucs2);
+        if (at < 0) {
+          done = true;
+          var tail = [pos, bytes.length];
+          pos = bytes.length;
+          return tail;
+        }
+        if (!ucs2 || ((at - pos) % 2 === 0)) break;
+        at += 1;
+      }
+      var range = [pos, at];
+      pos = at + delimLen;
+      return range;
+    }
+    return {
+      ucs2: ucs2,
+      next: function () {
+        var r = advance();
+        return r === null ? null : codec.decodeRange(bytes, ucs2, r[0], r[1]);
+      },
+      skip: function () {
+        return advance() !== null;
+      },
+    };
+  }
+
+  /**
+   * Parse a compiled game file from its BYTES.
+   * `name` is only used in messages (the path the caller read it from).
+   * Returns { file, bytes, format, crc, locations: [name...],
+   *           byUpper: Map<UPPERNAME, index> }.
+   * Throws GameFileError with a plain-language message when the file is not a
+   * readable game.
+   */
+  function readGameBuffer(input, name) {
+    var file = name === undefined ? 'the game file' : name;
+    var buf = codec.toBytes(input);
+    if (!buf) throw new GameFileError('the game file was not handed over as bytes');
+    if (buf.length < 8) throw new GameFileError('"' + file + '" is too small to be a QSP game file');
+
+    var cur = lineCursor(buf);
+    var head = [cur.next(), cur.next(), cur.next(), cur.next()];
+    if (head[0] === null) throw new GameFileError('"' + file + '" has no line structure — not a QSP game file');
+
+    var isOld = head[0] !== 'QSPGAME';
+    var locsCount;
+    var i, k;
+    if (isOld) {
+      locsCount = toNum(head[0]);          // qspStrToNum on the RAW line (game.c:174)
+      if (locsCount <= 0) {
+        throw new GameFileError('"' + file + '" is not a QSP game file (line 0 is ' +
+          JSON.stringify(String(head[0]).slice(0, 24)) + ', expected "QSPGAME" or a location count)');
+      }
+    } else {
+      locsCount = toNum(decode(head[3]));
+      if (locsCount <= 0) throw new GameFileError('"' + file + '" declares ' + locsCount + ' locations');
+    }
+
+    // Old format: the table starts at line 30, so skip lines 4..29.
+    if (isOld) for (i = 4; i < 30; i++) cur.skip();
+
+    var locations = [];
+    var byUpper = new Map();
+    for (i = 0; i < locsCount; i++) {
+      var rawName = cur.next();
+      if (rawName === null) {
+        throw new GameFileError('"' + file + '" ended after ' + i + ' of ' + locsCount +
+          ' locations — the game file is truncated');
+      }
+      var locName = decode(rawName);
+      locations.push(locName);
+      var up = locName.toUpperCase();
+      if (!byUpper.has(up)) byUpper.set(up, i); // qspLocIndex returns the FIRST match
+      cur.skip();                                // Desc
+      cur.skip();                                // OnVisit code
+      var actsCount;
+      if (isOld) {
+        actsCount = 20;
+      } else {
+        var raw = cur.next();
+        if (raw === null) throw new GameFileError('"' + file + '" is truncated inside location "' + locName + '"');
+        actsCount = toNum(decode(raw));
+        if (actsCount < 0 || actsCount > MAXACTIONS) {
+          throw new GameFileError('"' + file + '" declares ' + actsCount + ' actions for location "' + locName +
+            '" — the file is not a readable QSP game');
+        }
+      }
+      var fields = actsCount * (isOld ? 2 : 3);
+      for (k = 0; k < fields; k++) {
+        if (!cur.skip()) throw new GameFileError('"' + file + '" is truncated inside location "' + locName + '"');
+      }
+    }
+
+    return {
+      file: file,
+      bytes: buf.length,
+      format: isOld ? 'qsp-old' : 'qsp',
+      crc: qspCRC(buf),
+      locations: locations,
+      byUpper: byUpper,
+    };
+  }
+
+  return { readGameBuffer: readGameBuffer };
+}));
+
+// Rewrite a parsed legacy (5.7.0) save into a modern libqsp 5.9.0 save.
+//
+// Writer transcribed from libqsp @ 9f4f29f9 `qsp/game.c:274 qspSaveGameStatus`
+// and validated against `qsp/game.c:399 qspCheckGameStatus`, which refuses the
+// file outright if any of its bounds is violated. Every bound it checks is
+// re-checked here so a rejected save is reported as a converter error with a
+// sentence a player can act on, instead of "Error code: 14" at load time.
+//
+// The four substantive differences between the layouts:
+//
+//  1. LOCATION (line 10). Modern stores the name. See legacy-sav.js for why a
+//     classic file may hold either; an ordinal is resolved against the target
+//     `.qsp` — but only when the save's own game checksum proves that `.qsp` is
+//     the build the ordinal was written for — and the resolved name is
+//     validated to exist either way.
+//
+//  2. ACTIONS lose two trailing fields (`StartLine`, `IsManageLines`) that the
+//     modern engine has no member for, and their code bodies are RE-PREPARED.
+//
+//     A save stores the live action list, bodies and all, and each engine
+//     stores those bodies in the state its own parser left them in. The modern
+//     engine prepares a line for execution (uppercase everything outside
+//     string literals, codetools.c:580 -> :548) BEFORE splitting it into
+//     statements, and it re-reads a saved body with `qspInitLineOfCode` alone
+//     (game.c:541) — no preparation step. The classic 5.7 player does not
+//     prepare in place, so its saves carry the game's original lower-case
+//     source. Copied verbatim into a modern save, `gt 'pav_commercial'` is no
+//     longer a GOTO: keywords are matched case-sensitively against an
+//     uppercase table (codetools.c:30-34), the line falls through to "print
+//     this expression", and pressing the action raises "Unknown action!"
+//     (error 28) instead of moving. So every stored code line goes through
+//     `codec.prepareForExecution`, which is that same preparation step —
+//     the bytes the modern engine would have written itself.
+//
+//     `Location` is an ordinal into the location table of the game the save
+//     was made with, so after a version change it points at an unrelated
+//     location (measured: a 0.9.6.1 save standing in `pav_park` carries 1040,
+//     which is `trFatherMisha` in 0.9.9.1, and that name is what the engine
+//     then prints in an error banner). The modern engine reads it in exactly
+//     two places, both diagnostic — `qspRealCurLoc` for the location name in
+//     an error message (errors.c:42) and the same value handed to the frontend
+//     (bindings/default/default_control.c:64) — so it is REWRITTEN to the
+//     index of the location the save is standing in: still a guess, but a
+//     location that exists in the target game and is the right answer for a
+//     location's own actions, which is nearly all of them.
+//
+//  3. VARIABLES move from one flat list of 12 800 open-addressed slots
+//     (legacy variables.h:24) into 1024 chained buckets (libqsp
+//     variables.h:26). The bucket is recomputed with the modern hash — the old
+//     `hashSlot` field is meaningless here and is dropped.
+//
+//  4. VALUES are RE-TYPED. Legacy holds a Num AND a Str in every slot, so `x`
+//     and `$x` coexist; modern holds one tagged variant, so they cannot.
+//     Rule, and the evidence for it, in the README: a non-zero Num wins,
+//     otherwise a non-empty Str, otherwise the number 0. Slots where BOTH were
+//     set are counted and listed in the result as `retypeCollisions` — that is
+//     the only lossy step in the whole conversion, and it is lossy because the
+//     destination engine cannot represent the source state, not because the
+//     converter gives up.
+//
+//     ARRAY KEYS gain a `$` prefix: modern builds an index key as
+//     QSP_IND_STRID + the uppercased key (variant.c:403-405, variant.h:25),
+//     legacy stored the bare uppercased key (legacy variables.c:202). Without
+//     the prefix every string-keyed array lookup in the game would miss.
+//
+// Byte-level core: `toModern` returns a `Uint8Array`, and the module is
+// loadable both by node `require` and by a plain <script>/importScripts in the
+// webview (one copy of the code, two hosts).
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'), require('./errors'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.convert = factory(ns.codec, ns.errors);
+  }
+}(function (codec, errors) {
+  'use strict';
+
+  var encode = codec.encode;
+  var prepareForExecution = codec.prepareForExecution;
+  var bucketOf = codec.bucketOf;
+  var writeContainer = codec.writeContainer;
+  var VARSBUCKETS = codec.VARSBUCKETS;
+  var VARSMAXBUCKETSIZE = codec.VARSMAXBUCKETSIZE;
+  var ConvertError = errors.ConvertError;
+
+  var QSP_VER = '5.9.0';            // libqsp CMakeLists.txt:2 -> QSP_VER_STR
+  var SAVEDGAMEID = 'QSPSAVEDGAME'; // libqsp game.h:27
+  var T_NUM = 1, T_STR = 2, T_UNDEF = 5; // libqsp bindings/qsp.h:87-92
+
+  /**
+   * @param parsed  result of legacy-sav.parseLegacySav
+   * @param game    result of qsp-game.readGame (the .qsp to target)
+   * @returns { buffer, report }
+   */
+  function toModern(parsed, game) {
+    const h = parsed.header;
+    const notes = [];
+
+    // ---- 1. location -------------------------------------------------------
+    let location;
+    let locationSource;
+    const asName = h.locationField;
+    const nameHit = game.byUpper.has(asName.toUpperCase());
+    if (h.locationIsIndex && !nameHit) {
+      const idx = parseInt(asName, 10);
+      if (idx < 0) {
+        throw new ConvertError('the save is not standing in any location (index ' + idx +
+          '). It was probably written before the game finished starting up; there is nothing to restore.');
+      }
+      // An ordinal indexes the location table of the build the save was MADE
+      // with. Both engines stamp the save with qspCRC of that build's whole .qsp
+      // (legacy game.c:81/235/329, libqsp game.c:83/197 — byte-identical
+      // algorithm over the same bytes), so a CRC mismatch is proof that this is
+      // a different build and that the ordinal points somewhere else in it.
+      // Resolving it anyway produces a save that loads and puts the player in an
+      // unrelated location, with nothing on screen to say so.
+      if (h.qstCRC !== game.crc) {
+        throw new ConvertError('the save stores its location as a NUMBER (' + idx + '), and it was ' +
+          'made against a different build of the game (the save says checksum ' + h.qstCRC +
+          ', ' + game.file + ' is ' + game.crc + '). A location number only means anything ' +
+          'for the exact build it was written by, so translating it would silently put you in ' +
+          'the wrong place. Point --qsp at the .qsp this save was made with.');
+      }
+      if (idx >= game.locations.length) {
+        throw new ConvertError('the save is standing in location #' + idx + ', but ' +
+          game.file + ' only has ' + game.locations.length + ' locations. ' +
+          'This save was made with a different version of the game and its location ' +
+          'number cannot be translated. Point --qsp at the .qsp the save was made with.');
+      }
+      location = game.locations[idx];
+      locationSource = 'index ' + idx + ' resolved against ' + game.file;
+      notes.push('location came from an ORDINAL (' + idx + ' -> "' + location + '"), resolved ' +
+        'against a game file whose checksum matches the one the save was written with (' +
+        game.crc + '); verify the game starts you in the right place.');
+    } else {
+      location = asName;
+      locationSource = 'name stored in the save';
+      if (!nameHit) {
+        throw new ConvertError('the save is standing in location "' + location +
+          '", which does not exist in ' + game.file + '. This save is from a game version ' +
+          'whose locations were renamed or removed, so it cannot be translated safely.');
+      }
+    }
+
+    // ---- 2. bounds the modern engine enforces before it reads a body -------
+    if (h.timerInterval < 0) {
+      throw new ConvertError('the save has a negative timer interval (' + h.timerInterval +
+        ') — the modern engine refuses such a file');
+    }
+    if (parsed.playlist.length > 500) throw new ConvertError('the save lists ' + parsed.playlist.length + ' playlist files (limit 500)');
+    if (parsed.includes.length > 100) throw new ConvertError('the save lists ' + parsed.includes.length + ' included files (limit 100)');
+    if (parsed.actions.length > 50) throw new ConvertError('the save holds ' + parsed.actions.length + ' actions (limit 50)');
+    if (parsed.objects.length > 1000) throw new ConvertError('the save holds ' + parsed.objects.length + ' objects (limit 1000)');
+
+    let selAction = h.selAction;
+    if (selAction >= parsed.actions.length) {
+      notes.push('selected action ' + selAction + ' is out of range (' + parsed.actions.length +
+        ' actions) — reset to none');
+      selAction = -1;
+    }
+    let selObject = h.selObject;
+    if (selObject >= parsed.objects.length) {
+      notes.push('selected object ' + selObject + ' is out of range (' + parsed.objects.length +
+        ' objects) — reset to none');
+      selObject = -1;
+    }
+
+    // ---- 3. re-bucket + re-type the variables ------------------------------
+    const buckets = Array.from({ length: VARSBUCKETS }, () => []);
+    const retypeCollisions = [];
+    const paddedHoles = [];
+    const droppedIndices = [];
+    let numValues = 0, strValues = 0, undefValues = 0;
+
+    for (const v of parsed.vars) {
+      if (v.name === '') {
+        notes.push('a variable with an empty name was dropped');
+        continue;
+      }
+      const values = v.values.map((val) => {
+        if (val.num !== 0) {
+          if (val.str !== '') return { type: T_NUM, num: val.num, str: val.str, collided: true };
+          return { type: T_NUM, num: val.num };
+        }
+        if (val.str !== '') return { type: T_STR, str: val.str };
+        return { type: T_NUM, num: 0 };
+      });
+
+      // Legacy hands out an index slot at creation time and only fills it on
+      // write, so a key can point past the end of Values. Modern refuses that
+      // (game.c:481). Pad the gap with UNDEF — which is exactly what modern does
+      // for its own holes (variables.c:384) — so the key keeps working.
+      let maxIdx = -1;
+      for (const ind of v.indices) if (ind.index > maxIdx) maxIdx = ind.index;
+      if (maxIdx >= values.length) {
+        paddedHoles.push({ name: v.name, from: values.length, to: maxIdx });
+        while (values.length <= maxIdx) values.push({ type: T_UNDEF, str: '' });
+      }
+      const indices = [];
+      for (const ind of v.indices) {
+        if (ind.index < 0) { droppedIndices.push({ name: v.name, key: ind.key, index: ind.index }); continue; }
+        indices.push({ index: ind.index, key: '$' + ind.key });
+      }
+
+      for (let k = 0; k < values.length; k++) {
+        const val = values[k];
+        if (val.collided) {
+          const key = indices.find((x) => x.index === k);
+          retypeCollisions.push({
+            name: v.name,
+            slot: k,
+            key: key ? key.key.slice(1) : null,
+            keptNumber: val.num,
+            droppedString: val.str.length > 60 ? val.str.slice(0, 57) + '…' : val.str,
+          });
+        }
+        if (val.type === T_NUM) numValues++;
+        else if (val.type === T_STR) strValues++;
+        else undefValues++;
+      }
+      buckets[bucketOf(v.name)].push({ name: v.name, values, indices });
+    }
+
+    const overfull = [];
+    buckets.forEach((b, idx) => { if (b.length > VARSMAXBUCKETSIZE) overfull.push({ bucket: idx, count: b.length }); });
+    if (overfull.length) {
+      throw new ConvertError('the save has too many variables that hash together (' +
+        overfull.map((o) => 'bucket ' + o.bucket + ': ' + o.count).join(', ') +
+        '; the modern engine allows ' + VARSMAXBUCKETSIZE + ' per bucket)');
+    }
+
+    // ---- 4. the action list ------------------------------------------------
+    // Both fixes are described at the top of this file. `actionLocation` is
+    // resolved through the same map the location field itself was validated
+    // with, so it always names a location that exists in the target game.
+    const actionLocation = game.byUpper.get(location.toUpperCase());
+    const staleLocations = [...new Set(parsed.actions.map((a) => a.location))]
+      .filter((n) => n !== actionLocation);
+    let preparedLines = 0;
+
+    // ---- 5. serialise (game.c:274, field for field) ------------------------
+    const out = [];
+    const plain = (s) => out.push(s);
+    const enc = (s) => out.push(encode(s));
+    const num = (n) => out.push(encode(String(n)));
+
+    plain(SAVEDGAMEID);
+    plain(QSP_VER);
+    num(game.crc);
+    num(h.gameTime);
+    num(selAction);
+    num(selObject);
+    enc(h.viewPath);
+    enc(h.curInput);
+    enc(h.curDesc);
+    enc(h.curVars);
+    enc(location);
+    num(h.showActs);
+    num(h.showObjs);
+    num(h.showVars);
+    num(h.showInput);
+    num(h.timerInterval);
+    num(parsed.playlist.length);
+    for (const f of parsed.playlist) enc(f);
+    num(parsed.includes.length);
+    for (const f of parsed.includes) enc(f);
+    num(parsed.actions.length);
+    for (const a of parsed.actions) {
+      enc(a.image);
+      enc(a.desc);
+      num(a.code.length);
+      for (const [line, lineNum] of a.code) {
+        const ready = prepareForExecution(line);
+        if (ready !== line) preparedLines++;
+        enc(ready);
+        num(lineNum < 0 ? 0 : lineNum);
+      }
+      // game.c:445 refuses a negative location; see the header note on why the
+      // stored ordinal is replaced rather than carried across.
+      num(actionLocation);
+      num(a.actIndex);
+      // a.startLine / a.isManageLines are legacy-only and have no modern field
+    }
+    num(parsed.objects.length);
+    for (const o of parsed.objects) { enc(o.image); enc(o.desc); }
+    for (let b = 0; b < VARSBUCKETS; b++) {
+      const bucket = buckets[b];
+      num(bucket.length);
+      for (const v of bucket) {
+        enc(v.name);
+        num(v.values.length);
+        for (const val of v.values) {
+          num(val.type);
+          if (val.type === T_NUM) num(val.num);
+          else enc(val.str);
+        }
+        num(v.indices.length);
+        for (const ind of v.indices) { num(ind.index); enc(ind.key); }
+      }
+    }
+    out.push(''); // game.c:488 — the body ends exactly on the trailing empty line
+
+    if (parsed.actions.length) {
+      notes.push('the ' + parsed.actions.length + ' on-screen action' +
+        (parsed.actions.length === 1 ? '' : 's') + ' saved with this file ' +
+        (preparedLines
+          ? 'were rewritten in the form this engine expects (' + preparedLines +
+            ' line' + (preparedLines === 1 ? '' : 's') + '), so they still work when you press them'
+          : 'needed no rewriting') +
+        '; they are attributed to "' + location + '" because the old file pointed them at ' +
+        'a location number from its own version of the game' +
+        (staleLocations.length ? ' (' + staleLocations.join(', ') + ')' : '') +
+        '. Anything odd about them clears the moment you move.');
+    }
+
+    return {
+      buffer: writeContainer(out, h.ucs2),
+      report: {
+        engineVersionIn: h.engineVersion,
+        engineVersionOut: QSP_VER,
+        ucs2: h.ucs2,
+        location,
+        locationSource,
+        locationIndexInGame: game.byUpper.get(location.toUpperCase()),
+        // WP-154 (B-080): the mod files this save was running with, exactly as
+        // it spells them. Whether the game folder HAS them is the host's
+        // question — `lib/` never touches a filesystem.
+        mods: parsed.includes.slice(),
+        qstCRCIn: h.qstCRC,
+        qstCRCOut: game.crc,
+        gameFile: game.file,
+        gameLocations: game.locations.length,
+        gameTime: h.gameTime,
+        lineCountIn: h.lineCount,
+        lineCountOut: out.length,
+        actions: parsed.actions.length,
+        actionCodeLinesPrepared: preparedLines,
+        actionLocation,
+        actionLocationsInFile: staleLocations,
+        objects: parsed.objects.length,
+        variables: parsed.vars.length,
+        numValues, strValues, undefValues,
+        retypeCollisions,
+        paddedHoles,
+        droppedIndices,
+        notes,
+      },
+    };
+  }
+
+  /**
+   * WP-154 (B-080) — where an `includes` entry points inside the game folder,
+   * as path parts, or null when the name leaves it: an absolute path, a drive
+   * letter, or any `..` segment. A host resolves the parts against the folder
+   * the `.qsp` sits in; a null is reported as missing and never opened. The mod
+   * files themselves are never read — only the names the save carries.
+   */
+  function modPathParts(name) {
+    var text = String(name == null ? '' : name).trim();
+    if (!text || text.length > 200 || text.indexOf('\u0000') >= 0) return null;
+    var parts = text.split(/[\\/]/);
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part || part === '.' || part === '..' || part.indexOf(':') >= 0) return null;
+    }
+    return parts;
+  }
+
+  /**
+   * One plain sentence for a save that carries mods, or null for one that does
+   * not. No repair is offered: naming the files is the fix — what it replaces
+   * is a title screen with no message at all (WP-152 finding 1).
+   */
+  function modsNote(mods, missing) {
+    if (!mods || !mods.length) return null;
+    if (!missing || !missing.length) return 'Modded playthrough';
+    var shown = missing.slice(0, 6);
+    if (missing.length > 6) shown.push('and ' + (missing.length - 6) + ' more');
+    return 'Modded playthrough — needs: ' + shown.join(', ') + ' (not found in the game folder)';
+  }
+
+  return {
+    toModern: toModern, ConvertError: ConvertError, QSP_VER: QSP_VER,
+    modPathParts: modPathParts, modsNote: modsNote,
+  };
+}));
+
+// A line-for-line reimplementation of libqsp's own acceptance gate,
+// `qsp/game.c:399 qspCheckGameStatus` (@ 9f4f29f9), plus the container checks
+// `qspOpenGameStatus` does before calling it.
+//
+// The converter runs this over its OWN OUTPUT before that output is put in
+// place. If this says no, the engine would have said "Error code: 14" at load
+// time — and a save that fails to load after the player was told it converted
+// is exactly the failure mode this check exists to prevent.
+//
+// It is deliberately a separate transcription from lib/convert.js's writer: if
+// the writer misreads a rule, the reader has to misread it the same way for
+// the bug to survive, and the two were written from the two ends of the
+// engine's source (writer from qspSaveGameStatus, this from qspCheckGameStatus).
+//
+// Byte-level core — takes bytes, loadable in node and in the webview.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.modernCheck = factory(ns.codec);
+  }
+}(function (codec) {
+  'use strict';
+
+  var decode = codec.decode;
+  var toNum = codec.toNum;
+  var readContainer = codec.readContainer;
+  var VARSBUCKETS = codec.VARSBUCKETS;
+  var VARSMAXBUCKETSIZE = codec.VARSMAXBUCKETSIZE;
+
+  var GAMEMINVER = '5.9.0'; // libqsp CMakeLists.txt:4
+  var VER = '5.9.0';        // libqsp CMakeLists.txt:2
+  var MAXPLFILES = 500, MAXINCFILES = 100, MAXACTIONS = 50, MAXOBJECTS = 1000;
+  var TYPES = 6;            // QSP_TYPE_DEFINED_TYPES (bindings/qsp.h:93)
+  var BASE_TUPLE = 0, BASE_NUM = 1, BASE_STR = 2;
+  var BASETYPE = [BASE_TUPLE, BASE_NUM, BASE_STR, BASE_STR, BASE_STR, BASE_STR];
+
+  /**
+   * @returns { ok: true } or { ok: false, reason: string }
+   */
+  function checkModernSav(input) {
+    const buf = codec.toBytes(input);
+    if (!buf) return { ok: false, reason: 'the save was not handed over as bytes' };
+    const { lines } = readContainer(buf);
+    const n = lines.length;
+    const bad = (reason) => ({ ok: false, reason });
+
+    let ind = 16;
+    if (ind >= n) return bad('fewer than 17 lines');
+    if (lines[0] !== 'QSPSAVEDGAME') return bad('line 1 is not QSPSAVEDGAME');
+    // qspStrsComp is a plain lexicographic compare (text.h:241)
+    if (!(lines[1] >= GAMEMINVER)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts below ' + GAMEMINVER);
+    if (!(lines[1] <= VER)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts above ' + VER);
+    // The CRC test (game.c:408) is skipped by the engine whenever the game's
+    // DEBUG variable is non-zero, which Girl Life sets in start.qsrc:8, so it is
+    // not asserted here — but the converter still writes the correct value.
+    const num = (k) => toNum(decode(lines[k]));
+    const selAction = num(4);
+    const selObject = num(5);
+    if (num(15) < 0) return bad('negative timer interval');
+
+    const take = () => {
+      if (ind >= n) return null;
+      return num(ind++);
+    };
+    const skip = (k) => { ind += k; return ind < n; };
+
+    let count = take();
+    if (count === null || !skip(0)) return bad('truncated at the playlist count');
+    if (count < 0 || count > MAXPLFILES) return bad('playlist count ' + count);
+    if (!skip(count)) return bad('truncated inside the playlist');
+
+    count = take();
+    if (count === null) return bad('truncated at the includes count');
+    if (count < 0 || count > MAXINCFILES) return bad('includes count ' + count);
+    if (!skip(count)) return bad('truncated inside the includes');
+
+    count = take();
+    if (count === null) return bad('truncated at the actions count');
+    if (count < 0 || count > MAXACTIONS) return bad('actions count ' + count);
+    if (selAction >= count) return bad('selected action ' + selAction + ' >= ' + count + ' actions');
+    for (let i = 0; i < count; i++) {
+      if (!skip(2)) return bad('truncated in action ' + i + ' header');
+      const groups = take();
+      if (groups === null) return bad('truncated at action ' + i + ' code length');
+      if (groups < 0) return bad('negative code length in action ' + i);
+      for (let j = 0; j < groups; j++) {
+        if (!skip(1)) return bad('truncated in action ' + i + ' code');
+        const lineNum = take();
+        if (lineNum === null) return bad('truncated at an action line number');
+        if (lineNum < 0) return bad('negative line number in action ' + i);
+      }
+      const loc = take();
+      if (loc === null) return bad('truncated at action ' + i + ' location');
+      if (loc < 0) return bad('negative location in action ' + i);
+      if (!skip(1)) return bad('truncated at action ' + i + ' source index');
+    }
+
+    count = take();
+    if (count === null) return bad('truncated at the objects count');
+    if (count < 0 || count > MAXOBJECTS) return bad('objects count ' + count);
+    if (selObject >= count) return bad('selected object ' + selObject + ' >= ' + count + ' objects');
+    if (!skip(2 * count)) return bad('truncated inside the objects');
+
+    const readVariant = () => {
+      if (ind >= n) return { ok: false };
+      const type = num(ind++);
+      if (type < 0 || type >= TYPES) return { ok: false, why: 'value type ' + type };
+      switch (BASETYPE[type]) {
+        case BASE_TUPLE: {
+          if (ind >= n) return { ok: false };
+          const items = num(ind++);
+          for (let i = 0; i < items; i++) {
+            const r = readVariant();
+            if (!r.ok) return r;
+          }
+          return { ok: true };
+        }
+        default:
+          if (ind >= n) return { ok: false };
+          ind++;
+          return { ok: true };
+      }
+    };
+
+    for (let b = 0; b < VARSBUCKETS; b++) {
+      count = take();
+      if (count === null) return bad('truncated at bucket ' + b);
+      if (count < 0 || count > VARSMAXBUCKETSIZE) return bad('bucket ' + b + ' holds ' + count + ' variables');
+      for (let v = 0; v < count; v++) {
+        if (!skip(1)) return bad('truncated at a variable name in bucket ' + b);
+        const valsCount = take();
+        if (valsCount === null) return bad('truncated at a value count in bucket ' + b);
+        if (valsCount < 0) return bad('negative value count in bucket ' + b);
+        for (let k = 0; k < valsCount; k++) {
+          const r = readVariant();
+          if (!r.ok) return bad('bad value in bucket ' + b + (r.why ? ' — ' + r.why : ' — truncated'));
+        }
+        const inds = take();
+        if (inds === null) return bad('truncated at an index count in bucket ' + b);
+        if (inds < 0) return bad('negative index count in bucket ' + b);
+        for (let k = 0; k < inds; k++) {
+          const at = take();
+          if (at === null) return bad('truncated at an array index in bucket ' + b);
+          if (at < 0 || at >= valsCount) return bad('array index ' + at + ' out of range (' + valsCount + ' values)');
+          if (!skip(1)) return bad('truncated at an array key in bucket ' + b);
+        }
+      }
+    }
+    // game.c:488 — the last line is always empty and must fall exactly where the walk stopped
+    if (ind !== n - 1) return bad('body ends at line ' + ind + ' of ' + n + ', expected ' + (n - 1));
+    if (lines[n - 1] !== '') return bad('the file does not end with an empty line');
+    return { ok: true };
+  }
+
+  return { checkModernSav: checkModernSav };
+}));
+
+// Strict reader for a MODERN libqsp `.sav` (engine stamp 5.9.0) — the mirror
+// image of `legacy-sav.js`, and the front half of the REVERSE converter.
+//
+// Layout transcribed from libqsp @ 9f4f29f9 `qsp/game.c:274
+// (qspSaveGameStatus)` and its own acceptance gate at `:399`:
+//
+//   [0]  "QSPSAVEDGAME"      (not encoded)
+//   [1]  engine version      (not encoded)
+//   ...everything below is encoded (codec.decode)...
+//   [2]  qspQstCRC of the .qsp the save was made against
+//   [3]  qspGetTime()        [4] selected action   [5] selected object
+//   [6]  view path           [7] input text        [8] main description
+//   [9]  vars description    [10] CURRENT LOCATION NAME  [11..14] window flags
+//   [15] timer interval      [16] playlist count -> that many file names
+//   then: includes count -> names
+//   then: actions count -> per action
+//         Image, Desc, linesCount, (line, lineNum)*, Location, ActIndex
+//   then: objects count -> per object: Image, Desc
+//   then: 1024 BUCKETS, each: count -> per variable
+//         Name, valsCount, (variant)*, indsCount, (Index, Str)*
+//   then: one trailing empty line.
+//
+// A "variant" is a TYPE line (bindings/qsp.h:87-92 — TUPLE 0, NUM 1, STR 2,
+// CODE 3, VARREF 4, UNDEF 5) followed by one payload line, except a TUPLE,
+// which is followed by an item count and that many nested variants
+// (coding.c qspAppendEncodedVariant). Types 3/4/5 serialise through the STRING
+// branch (`BASETYPE` in game.c:399), so their payload is one text line.
+//
+// Everything is strict, for the same reason the legacy reader is: a converter
+// that guesses at a layout produces a save that loads and then behaves wrongly.
+//
+// Byte-level core — takes bytes (`Uint8Array`, a node `Buffer`, or an
+// `ArrayBuffer`), never a path.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'), require('./errors'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.modernSav = factory(ns.codec, ns.errors);
+  }
+}(function (codec, errors) {
+  'use strict';
+
+  var decode = codec.decode;
+  var SavFormatError = errors.SavFormatError;
+  var VARSBUCKETS = codec.VARSBUCKETS;
+  var VARSMAXBUCKETSIZE = codec.VARSMAXBUCKETSIZE;
+
+  var T_TUPLE = 0, T_NUM = 1, T_STR = 2, T_CODE = 3, T_VARREF = 4, T_UNDEF = 5;
+  var TYPE_NAME = ['tuple', 'number', 'string', 'code', 'variable reference', 'unset'];
+  // game.c:399 BASETYPE — which branch of the writer each type went through
+  var BASETYPE = [T_TUPLE, T_NUM, T_STR, T_STR, T_STR, T_STR];
+
+  function parseModernSav(input) {
+    var buf = codec.toBytes(input);
+    if (!buf || buf.length < 4) {
+      throw new SavFormatError('the file is empty or far too small to be a QSP save');
+    }
+    var container = codec.readContainer(buf);
+    var ucs2 = container.ucs2;
+    var lines = container.lines;
+    if (lines[0] !== 'QSPSAVEDGAME') {
+      throw new SavFormatError('not a QSP save file — line 1 reads ' +
+        JSON.stringify(String(lines[0]).slice(0, 32)) + ', expected "QSPSAVEDGAME"');
+    }
+    var engineVersion = lines[1];
+    if (lines.length < 18) {
+      throw new SavFormatError('QSP save header, but only ' + lines.length +
+        ' lines — the file is truncated before the body');
+    }
+
+    var i = 0;
+    var raw = function () {
+      if (i >= lines.length) {
+        throw new SavFormatError('the save ends in the middle of its body — the file has ' +
+          lines.length + ' lines and is truncated');
+      }
+      return lines[i++];
+    };
+    var str = function () { return decode(raw()); };
+    var int = function (what) {
+      var at = i + 1;
+      var text = str();
+      if (!/^-?\d+$/.test(text)) {
+        throw new SavFormatError('expected ' + what + ' (a number) on line ' + at +
+          ', found ' + JSON.stringify(text.slice(0, 32)) + ' — this is not a 5.9.0 save body');
+      }
+      return parseInt(text, 10);
+    };
+    var count = function (what, max) {
+      var at = i + 1;
+      var n = int(what);
+      if (n < 0 || n > max) {
+        throw new SavFormatError(what + ' on line ' + at + ' reads ' + n +
+          ' — impossible for this file (limit ' + max + '); the save is corrupt');
+      }
+      return n;
+    };
+
+    i = 2;
+    var head = {
+      bytes: buf.length,
+      ucs2: ucs2,
+      lineCount: lines.length,
+      engineVersion: engineVersion,
+      qstCRC: int('the game CRC'),
+      gameTime: int('the game clock'),
+      selAction: int('the selected action'),
+      selObject: int('the selected object'),
+      viewPath: str(),
+      curInput: str(),
+      curDesc: str(),
+      curVars: str(),
+    };
+    // Modern always stores the location NAME (game.c:300) — never an ordinal.
+    head.location = str();
+    head.showActs = int('the actions-window flag');
+    head.showObjs = int('the objects-window flag');
+    head.showVars = int('the stats-window flag');
+    head.showInput = int('the input-window flag');
+    head.timerInterval = int('the timer interval');
+
+    var k, l, v;
+    var playlist = [];
+    var plCount = count('the playlist length', 500);   // game.c:399 QSP_MAXPLFILES
+    for (k = 0; k < plCount; k++) playlist.push(str());
+
+    var includes = [];
+    var incCount = count('the includes count', 100);   // QSP_MAXINCFILES
+    for (k = 0; k < incCount; k++) includes.push(str());
+
+    var actions = [];
+    var actsCount = count('the actions count', 50);    // QSP_MAXACTIONS
+    for (k = 0; k < actsCount; k++) {
+      var image = str();
+      var desc = str();
+      var linesCount = count('an action code length', lines.length);
+      var code = [];
+      for (l = 0; l < linesCount; l++) code.push([str(), int('an action line number')]);
+      actions.push({
+        image: image,
+        desc: desc,
+        code: code,
+        location: int('an action location'),
+        actIndex: int('an action source index'),
+      });
+    }
+
+    var objects = [];
+    var objsCount = count('the objects count', 1000);  // QSP_MAXOBJECTS
+    for (k = 0; k < objsCount; k++) objects.push({ image: str(), desc: str() });
+
+    /** One variant: {type, num} | {type, str} | {type: 0, items: [...]}. */
+    function readVariant(varName) {
+      var at = i + 1;
+      var type = int('a value type');
+      if (type < 0 || type >= BASETYPE.length) {
+        throw new SavFormatError('variable ' + varName + ' has a value of unknown type ' + type +
+          ' on line ' + at + ' — this is not a 5.9.0 save body');
+      }
+      if (BASETYPE[type] === T_TUPLE) {
+        var items = count('a tuple length', lines.length);
+        var vals = [];
+        for (var t = 0; t < items; t++) vals.push(readVariant(varName));
+        return { type: type, items: vals };
+      }
+      if (BASETYPE[type] === T_NUM) return { type: type, num: int('a variable number') };
+      return { type: type, str: str() };
+    }
+
+    var vars = [];
+    var buckets = new Array(VARSBUCKETS);
+    for (var b = 0; b < VARSBUCKETS; b++) {
+      var inBucket = count('the variable count of bucket ' + b, VARSMAXBUCKETSIZE);
+      buckets[b] = inBucket;
+      for (v = 0; v < inBucket; v++) {
+        var name = str();
+        var valsCount = count('a variable value count', lines.length);
+        var values = [];
+        for (k = 0; k < valsCount; k++) values.push(readVariant(name));
+        var indsCount = count('a variable index count', lines.length);
+        var indices = [];
+        for (k = 0; k < indsCount; k++) indices.push({ index: int('an array index'), key: str() });
+        vars.push({ bucket: b, name: name, values: values, indices: indices });
+      }
+    }
+
+    // game.c:488 — the body ends exactly on the trailing empty line, and
+    // game.c:493 refuses the file when it does not.
+    if (i !== lines.length - 1 || lines[lines.length - 1] !== '') {
+      throw new SavFormatError('the body does not end where a 5.9.0 save should ' +
+        '(stopped at line ' + i + ' of ' + lines.length + ') — the file is corrupt or ' +
+        'was written by a player this converter does not know');
+    }
+
+    return {
+      header: head, playlist: playlist, includes: includes,
+      actions: actions, objects: objects, vars: vars, buckets: buckets,
+    };
+  }
+
+  return {
+    parseModernSav: parseModernSav,
+    SavFormatError: SavFormatError,
+    T_TUPLE: T_TUPLE, T_NUM: T_NUM, T_STR: T_STR,
+    T_CODE: T_CODE, T_VARREF: T_VARREF, T_UNDEF: T_UNDEF,
+    TYPE_NAME: TYPE_NAME,
+  };
+}));
+
+// Rewrite a parsed MODERN (libqsp 5.9.0) save into a CLASSIC (QSP 5.7.0) save.
+//
+// The mirror of `convert.js`. Writer transcribed from qsp-legacy @ 16b85ac
+// `src/game.c:325 qspSaveGameStatusToString` and validated against
+// `src/game.c:404 qspCheckGameStatus` (transcribed separately in
+// `legacy-check.js`), which refuses the file outright if any bound is violated.
+//
+// The five substantive differences between the layouts, in the direction that
+// matters here:
+//
+//  1. LOCATION (line 10). Modern always stores the NAME (game.c:300). Classic
+//     players disagree with each other about this field, and the disagreement
+//     is silent either way:
+//       * stock qsp-legacy reads it as an ORDINAL into the location table
+//         (game.c:492 `qspCurLoc = qspReCodeGetIntVal(strs[10])`), and
+//         `qspStrToNum` returns 0 for text (text.c:341, no validity check), so
+//         a name lands the player in location 0;
+//       * Qqsp 1.9 — the player Girl Life players actually use, and the one
+//         every save in this repo's classic corpus came from — writes the NAME
+//         there, like modern does, so it must read one too.
+//     So the caller CHOOSES (`locationAs`), the choice is stated in the report
+//     and printed by the CLI, and either way the name must exist in the target
+//     `.qsp`: a location that is gone is a hard refusal, never a guess.
+//
+//  2. ACTIONS gain back the two trailing fields modern has no member for:
+//     `StartLine` and `IsManageLines` (game.c:377-378). Both are diagnostic —
+//     `qspExecAction` (actions.c:119-125) uses them only as the code offset
+//     for error line numbers — so they are written as 0 / 0, which is what an
+//     action added outside a managed block carries anyway. `StartLine` must be
+//     >= 0 or the classic gate refuses the file.
+//
+//     `Location` is REWRITTEN to the index of the location the save is
+//     standing in, for the same reason `convert.js` rewrites it the other way:
+//     the stored ordinal indexes the location table of the build that wrote
+//     the save, and classic reads the field back into `qspRealCurLoc`
+//     (actions.c:116) — diagnostic there too, but it must at least name a
+//     location that exists in the target game.
+//
+//     The code bodies are carried across VERBATIM, still in the modern
+//     engine's uppercased "prepared" form (codetools.c:548). That is safe in
+//     the other direction, and unlike the forward converter this one has no
+//     work to do: classic matches statement keywords against an UPPERCASED
+//     COPY of the line (`qspUpperStr(uStr = qspGetNewText(s, qspStatMaxLen))`,
+//     statements.c:247, and the same at :654 in `qspInitLineOfCode`), i.e. it
+//     is case-INSENSITIVE where modern is case-sensitive. Proven end to end in
+//     the classic oracle — see docs/reports/wp-63-reverse-converter.md §5.
+//
+//  3. VARIABLES move from 1024 chained buckets (libqsp variables.h:26) back
+//     into ONE FLAT ARRAY of 256 blocks x 50 open-addressed slots (qsp-legacy
+//     variables.h:24-25). The modern bucket number is meaningless there and is
+//     dropped; the slot is recomputed with the legacy hash
+//     (`codec.legacyBlockOf`, variables.c:161-165) and the block is PACKED
+//     CONTIGUOUSLY from `50 * block`, because `qspVarReference` linear-probes
+//     forward and STOPS at the first empty slot (variables.c:167-171) — a hole
+//     makes every variable behind it unreachable, silently. More than 50
+//     variables in one block is the engine's own `QSP_ERR_TOOMANYVARS` and is
+//     refused here instead. Slots are emitted in ascending order because the
+//     classic gate requires it (`temp <= lastInd` -> refuse, game.c:459).
+//
+//  4. VALUES are RE-TYPED back into legacy's Num+Str PAIR (variables.h:29-33):
+//     a modern NUM becomes `(n, "")`, a modern STR becomes `(0, s)`. The pair
+//     is what makes `x` and `$x` independent in classic; a modern save cannot
+//     say what the other half was, so the half it does not carry is written
+//     empty. That is not a loss THIS converter introduces — it is the loss the
+//     forward direction already took (README §3.4) showing up on the way back.
+//     CODE and VARREF values (types 3 and 4) have no legacy type; they
+//     serialise through the string branch on both sides (game.c:399 BASETYPE),
+//     so they are written as plain strings and every one is listed in the
+//     report. A TUPLE cannot be represented at all and is a hard refusal.
+//
+//  5. ARRAY KEYS lose the `$` prefix: modern builds an index key as
+//     QSP_IND_STRID + the uppercased key (variant.c:403-405, variant.h:25),
+//     legacy stores the bare uppercased key (variables.c:198-232). Both keep
+//     the table sorted and `bsearch` it, and stripping the same leading
+//     character from every key preserves that order. Leave the prefix on and
+//     every string-keyed array lookup in the game misses — silently, which is
+//     most of Girl Life's state.
+//
+// Byte-level core: `toLegacy` returns a `Uint8Array`, and the module is
+// loadable both by node `require` and by a plain <script>/importScripts.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'), require('./errors'), require('./modern-sav'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.reverse = factory(ns.codec, ns.errors, ns.modernSav);
+  }
+}(function (codec, errors, modernSav) {
+  'use strict';
+
+  var encode = codec.encode;
+  var writeContainer = codec.writeContainer;
+  var VARSSEEK = codec.VARSSEEK;      // 50 slots per block
+  var VARSCOUNT = codec.VARSCOUNT;    // 12 800 slots in total
+  var ConvertError = errors.ConvertError;
+
+  var LEGACY_VER = '5.7.0';           // qsp-legacy CMakeLists.txt:2
+  var SAVEDGAMEID = 'QSPSAVEDGAME';   // qsp-legacy game.h:27
+  var T_TUPLE = modernSav.T_TUPLE, T_NUM = modernSav.T_NUM;
+  var T_CODE = modernSav.T_CODE, T_VARREF = modernSav.T_VARREF;
+
+  // qsp-legacy declarations.h:88 — a name containing any of these, or starting
+  // with a digit, is rejected by `qspVarReference` (variables.c:156) with
+  // QSP_ERR_NOTCORRECTNAME, i.e. it can never be read back.
+  var DELIMS = ' \t&\'"()[]=!<>+-/*:,{}';
+
+  /**
+   * The three primitives the falsification gate needs to be able to break, and
+   * the reason they are reached through this object rather than called
+   * directly: each one is a silent-failure mechanism (wrong slot, un-stripped
+   * key, wrong half of the value pair), and the repo rule is that every
+   * assertion must be PROVEN able to fail. `tools/theme-test/wp63-reverse.js`
+   * substitutes a broken version of each and requires the gate to go red.
+   * Nothing else ever touches them.
+   */
+  var hooks = {
+    /** legacy block (0-255) for an uppercase, `$`-less variable name */
+    blockOf: function (name) { return codec.legacyBlockOf(name); },
+    /** modern index key ("$FOO") -> legacy index key ("FOO") */
+    stripKey: function (key) { return key.charAt(0) === '$' ? key.slice(1) : key; },
+    /** one modern variant -> legacy's { num, str } pair */
+    valueToPair: function (val) {
+      if (val.type === T_NUM) return { num: val.num, str: '' };
+      return { num: 0, str: val.str };
+    },
+    /** what goes on line 10 */
+    locationField: function (name, index, asIndex) { return asIndex ? String(index) : name; },
+  };
+
+  /**
+   * @param parsed  result of modern-sav.parseModernSav
+   * @param game    result of qsp-game.readGame (the .qsp the classic player will open)
+   * @param opts    { locationAs: 'name' | 'index' }
+   * @returns { buffer, report }
+   */
+  function toLegacy(parsed, game, opts) {
+    const h = parsed.header;
+    const options = opts || {};
+    const locationAs = options.locationAs === 'index' ? 'index' : 'name';
+    const notes = [];
+
+    // ---- 1. location -------------------------------------------------------
+    const location = h.location;
+    const locIndex = game.byUpper.get(String(location).toUpperCase());
+    if (locIndex === undefined) {
+      throw new ConvertError('the save is standing in location "' + location +
+        '", which does not exist in ' + game.file + '. Point --qsp at the .qsp the classic ' +
+        'player will open this save with — a save cannot be moved to a game whose locations ' +
+        'were renamed or removed.');
+    }
+    const locationField = hooks.locationField(location, locIndex, locationAs === 'index');
+    if (locationAs === 'index') {
+      notes.push('line 10 carries the location ORDINAL (' + locIndex + ' = "' + location +
+        '"), which is what stock QSP 5.7.0 players read. Qqsp 1.9 expects the NAME there and ' +
+        'will not find this location — convert without --loc-index for Qqsp.');
+    } else {
+      notes.push('line 10 carries the location NAME ("' + location + '"), which is what ' +
+        'Qqsp 1.9 writes and reads. A stock QSP 5.7.0 player reads that field as a number, ' +
+        'gets 0, and starts you in the game\'s first location instead — everything else ' +
+        '(variables, actions, objects) still restores. Use --loc-index for those players.');
+    }
+
+    // ---- 2. bounds the classic engine enforces before it reads a body ------
+    if (h.timerInterval < 0) {
+      throw new ConvertError('the save has a negative timer interval (' + h.timerInterval +
+        ') — the classic engine refuses such a file');
+    }
+    if (parsed.playlist.length > 500) throw new ConvertError('the save lists ' + parsed.playlist.length + ' playlist files (limit 500)');
+    if (parsed.includes.length > 100) throw new ConvertError('the save lists ' + parsed.includes.length + ' included files (limit 100)');
+    if (parsed.actions.length > 50) throw new ConvertError('the save holds ' + parsed.actions.length + ' actions (limit 50)');
+    if (parsed.objects.length > 1000) throw new ConvertError('the save holds ' + parsed.objects.length + ' objects (limit 1000)');
+
+    let selAction = h.selAction;
+    if (selAction >= parsed.actions.length) {
+      notes.push('selected action ' + selAction + ' is out of range (' + parsed.actions.length +
+        ' actions) — reset to none');
+      selAction = -1;
+    }
+    let selObject = h.selObject;
+    if (selObject >= parsed.objects.length) {
+      notes.push('selected object ' + selObject + ' is out of range (' + parsed.objects.length +
+        ' objects) — reset to none');
+      selObject = -1;
+    }
+
+    // ---- 3. re-slot + re-type the variables --------------------------------
+    const blocks = [];
+    for (let b = 0; b < 256; b++) blocks.push([]);
+    const downgradedValues = [];   // CODE / VARREF written as plain strings
+    const droppedVariables = [];   // names the classic engine could never read
+    const strippedNames = [];      // a `$` that should not have been in a name
+    const keysWithoutPrefix = [];  // an index key that carried no `$`
+    const tupleValues = [];        // refusal material
+    let numValues = 0, strValues = 0, emptyValues = 0;
+
+    for (const v of parsed.vars) {
+      let name = v.name;
+      // `qspVarReference` strips one leading `$` before hashing (variables.c:155),
+      // so a stored name that carries one can never be found again. The modern
+      // engine strips it too, so this cannot come from a real save — but if it
+      // ever does, dropping the prefix makes the variable reachable instead of
+      // dead, and the change is reported.
+      if (name.charAt(0) === '$') {
+        strippedNames.push(name);
+        name = name.slice(1);
+      }
+      if (name === '' || /^[0-9]/.test(name) || Array.prototype.some.call(DELIMS, (c) => name.indexOf(c) >= 0)) {
+        droppedVariables.push({ name: v.name, values: v.values.length, why: 'the classic engine cannot read a variable by this name' });
+        continue;
+      }
+
+      const values = [];
+      for (let k = 0; k < v.values.length; k++) {
+        const val = v.values[k];
+        if (val.type === T_TUPLE) {
+          tupleValues.push({ name: name, slot: k });
+          values.push({ num: 0, str: '' });
+          continue;
+        }
+        if (val.type === T_CODE || val.type === T_VARREF) {
+          downgradedValues.push({
+            name: name, slot: k,
+            type: modernSav.TYPE_NAME[val.type],
+            text: val.str.length > 60 ? val.str.slice(0, 57) + '…' : val.str,
+          });
+        }
+        const pair = hooks.valueToPair(val);
+        values.push(pair);
+        if (pair.num !== 0) numValues++;
+        else if (pair.str !== '') strValues++;
+        else emptyValues++;
+      }
+
+      const indices = [];
+      for (const ind of v.indices) {
+        if (ind.key.charAt(0) !== '$') keysWithoutPrefix.push({ name: name, key: ind.key });
+        indices.push({ index: ind.index, key: hooks.stripKey(ind.key) });
+        if (ind.index < 0 || ind.index >= values.length) {
+          throw new ConvertError('array key "' + ind.key + '" of ' + name + ' points at value slot ' +
+            ind.index + ', but the variable has ' + values.length + ' values. The save is inconsistent; ' +
+            'nothing was written.');
+        }
+      }
+
+      blocks[hooks.blockOf(name)].push({ name: name, values: values, indices: indices });
+    }
+
+    if (tupleValues.length) {
+      const sample = tupleValues.slice(0, 5).map((t) => t.name + '[' + t.slot + ']').join(', ');
+      throw new ConvertError('this save holds ' + tupleValues.length + ' TUPLE value(s) (' + sample +
+        (tupleValues.length > 5 ? ', …' : '') + '). Tuples exist only in the modern engine — ' +
+        'QSP 5.7.0 has no such type, so this state cannot be carried back to the classic player. ' +
+        'Nothing was written.');
+    }
+
+    const overfull = [];
+    blocks.forEach((b, idx) => { if (b.length > VARSSEEK) overfull.push({ block: idx, count: b.length }); });
+    if (overfull.length) {
+      throw new ConvertError('the save has too many variables that hash together (' +
+        overfull.map((o) => 'block ' + o.block + ': ' + o.count).join(', ') +
+        '; the classic engine allows ' + VARSSEEK + ' per block and reports "too many variables" beyond that)');
+    }
+
+    // Pack each block contiguously from its first slot, in ascending slot
+    // order — both properties are load-bearing (see the header note 3).
+    const placed = [];
+    let maxBlockLoad = 0;
+    for (let b = 0; b < 256; b++) {
+      const block = blocks[b];
+      if (block.length > maxBlockLoad) maxBlockLoad = block.length;
+      for (let k = 0; k < block.length; k++) {
+        placed.push({ slot: b * VARSSEEK + k, v: block[k] });
+      }
+    }
+    if (placed.length && placed[placed.length - 1].slot >= VARSCOUNT) {
+      throw new ConvertError('the save needs a variable slot past the classic engine\'s ' + VARSCOUNT);
+    }
+
+    // ---- 4. the action list ------------------------------------------------
+    const staleLocations = [...new Set(parsed.actions.map((a) => a.location))].filter((n) => n !== locIndex);
+
+    // ---- 5. serialise (qsp-legacy game.c:325, field for field) -------------
+    const out = [];
+    const plain = (s) => out.push(s);
+    const enc = (s) => out.push(encode(s));
+    const num = (n) => out.push(encode(String(n)));
+
+    plain(SAVEDGAMEID);
+    plain(LEGACY_VER);
+    num(game.crc);
+    num(h.gameTime);
+    num(selAction);
+    num(selObject);
+    enc(h.viewPath);
+    enc(h.curInput);
+    enc(h.curDesc);
+    enc(h.curVars);
+    enc(locationField);
+    num(h.showActs);
+    num(h.showObjs);
+    num(h.showVars);
+    num(h.showInput);
+    num(h.timerInterval);
+    num(parsed.playlist.length);
+    for (const f of parsed.playlist) enc(f);
+    num(parsed.includes.length);
+    for (const f of parsed.includes) enc(f);
+    num(parsed.actions.length);
+    for (const a of parsed.actions) {
+      enc(a.image);
+      enc(a.desc);
+      num(a.code.length);
+      for (const [line, lineNum] of a.code) {
+        enc(line);
+        num(lineNum < 0 ? 0 : lineNum);
+      }
+      num(locIndex);        // Location  — see header note 2
+      num(a.actIndex);      // ActIndex  — carried across, diagnostic
+      num(0);               // StartLine     } legacy-only, diagnostic;
+      num(0);               // IsManageLines } game.c:459 needs StartLine >= 0
+    }
+    num(parsed.objects.length);
+    for (const o of parsed.objects) { enc(o.image); enc(o.desc); }
+    num(placed.length);
+    for (const p of placed) {
+      num(p.slot);
+      enc(p.v.name);
+      num(p.v.values.length);
+      for (const val of p.v.values) { num(val.num); enc(val.str); }
+      num(p.v.indices.length);
+      for (const ind of p.v.indices) { num(ind.index); enc(ind.key); }
+    }
+    out.push(''); // every field is written WITH its delimiter (coding.c
+                  // qspCodeWriteVal), so the body ends on an empty line
+
+    if (parsed.actions.length) {
+      notes.push('the ' + parsed.actions.length + ' on-screen action' +
+        (parsed.actions.length === 1 ? '' : 's') + ' saved with this file are attributed to "' +
+        location + '" (#' + locIndex + ')' +
+        (staleLocations.length ? ' — the modern file pointed them at ' + staleLocations.join(', ') : '') +
+        ', and their code is kept in the uppercased form the modern engine stores. The classic ' +
+        'engine matches keywords case-insensitively (statements.c:247), so they still work when ' +
+        'you press them. Anything odd about them clears the moment you move.');
+    }
+    if (droppedVariables.length) {
+      notes.push(droppedVariables.length + ' variable(s) were dropped because a QSP 5.7.0 ' +
+        'engine cannot look up a name like that: ' +
+        droppedVariables.slice(0, 5).map((d) => JSON.stringify(d.name)).join(', ') +
+        (droppedVariables.length > 5 ? ', …' : ''));
+    }
+
+    return {
+      buffer: writeContainer(out, h.ucs2),
+      report: {
+        engineVersionIn: h.engineVersion,
+        engineVersionOut: LEGACY_VER,
+        ucs2: h.ucs2,
+        location,
+        locationAs,
+        locationField,
+        locationIndexInGame: locIndex,
+        qstCRCIn: h.qstCRC,
+        qstCRCOut: game.crc,
+        crcChanged: h.qstCRC !== game.crc,
+        gameFile: game.file,
+        gameLocations: game.locations.length,
+        gameTime: h.gameTime,
+        lineCountIn: h.lineCount,
+        lineCountOut: out.length,
+        actions: parsed.actions.length,
+        actionLocation: locIndex,
+        actionLocationsInFile: staleLocations,
+        objects: parsed.objects.length,
+        variablesIn: parsed.vars.length,
+        variables: placed.length,
+        maxBlockLoad,
+        numValues, strValues, emptyValues,
+        downgradedValues,
+        droppedVariables,
+        strippedNames,
+        keysWithoutPrefix,
+        notes,
+      },
+    };
+  }
+
+  return { toLegacy: toLegacy, hooks: hooks, ConvertError: ConvertError, LEGACY_VER: LEGACY_VER };
+}));
+
+// A line-for-line reimplementation of qsp-legacy 5.7.0's OWN acceptance gate,
+// `src/game.c:404 qspCheckGameStatus` (@ 16b85ac) — the mirror image of
+// `modern-check.js`, and for the same purpose: the REVERSE converter runs this
+// over its own output before that output is put in place. If this says no, the
+// classic player would have said "Can't load file" (QSP_ERR_CANTLOADFILE) and
+// the player would be holding a save that does not open.
+//
+// It is deliberately a SEPARATE transcription from `reverse.js`'s writer: the
+// writer was built from `qspSaveGameStatusToString` (game.c:325), this from
+// `qspCheckGameStatus`, so a misreading has to occur twice in the same
+// direction to survive.
+//
+// Three rules here have no counterpart on the modern side and every one of
+// them is a way to hand a player a broken save:
+//
+//   * line 10 (the current location) is read with `qspReCodeGetIntVal`, i.e.
+//     `qspStrToNum` with no validity check (text.c:341), so a NAME parses as 0
+//     and passes the `>= 0` test. Stock qsp-legacy then stands the player in
+//     location 0. That is a real divergence between classic players, not a
+//     format error — see reverse.js and the README's §6.
+//   * every action carries TWO more fields than a modern one, and
+//     `StartLine` must be >= 0.
+//   * the variable slot numbers must be STRICTLY ASCENDING and below
+//     QSP_VARSCOUNT (12 800): `if (temp <= lastInd || temp >= QSP_VARSCOUNT)`.
+//     The reader then drops each variable at `qspVars[thatSlot]` verbatim
+//     (game.c:551), so the slot is not a hint — it is the address the engine
+//     will look the variable up at.
+//
+// Byte-level core — takes bytes, loadable in node and in the webview.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('./codec'));
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    ns.legacyCheck = factory(ns.codec);
+  }
+}(function (codec) {
+  'use strict';
+
+  var decode = codec.decode;
+  var toNum = codec.toNum;
+  var readContainer = codec.readContainer;
+  var VARSCOUNT = codec.VARSCOUNT;
+
+  var GAMEMINVER = '5.7.0'; // qsp-legacy CMakeLists.txt:4 QSP_LEGACY_GAMEMIN_VER
+  var VER = '5.7.0';        // qsp-legacy CMakeLists.txt:2 project(... VERSION 5.7.0)
+  var MAXPLFILES = 500, MAXINCFILES = 100, MAXACTIONS = 50, MAXOBJECTS = 1000;
+
+  /**
+   * @returns { ok: true } or { ok: false, reason: string }
+   */
+  function checkLegacySav(input) {
+    const buf = codec.toBytes(input);
+    if (!buf) return { ok: false, reason: 'the save was not handed over as bytes' };
+    const { lines } = readContainer(buf);
+    const n = lines.length;
+    const bad = (reason) => ({ ok: false, reason });
+
+    let ind = 17;
+    if (ind > n) return bad('fewer than 17 lines');
+    if (lines[0] !== 'QSPSAVEDGAME') return bad('line 1 is not QSPSAVEDGAME');
+    // qspStrsComp is a plain code-unit compare (text.c), same as modern's
+    if (!(lines[1] >= GAMEMINVER)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts below ' + GAMEMINVER);
+    if (!(lines[1] <= VER)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts above ' + VER);
+    // The CRC test (game.c:414) is skipped whenever the game's DEBUG variable
+    // is non-zero, which Girl Life sets in start.qsrc:8 — and it is read from
+    // the state that is loaded AT THAT MOMENT, which no offline check can see.
+    // The converter writes the target game's own CRC regardless.
+    const num = (k) => toNum(decode(lines[k]));
+    const selAction = num(4);
+    const selObject = num(5);
+    if (num(10) < 0) return bad('negative current location');
+    if (num(15) < 0) return bad('negative timer interval');
+
+    let temp = num(16);
+    if (temp < 0 || temp > MAXPLFILES || (ind += temp) > n) return bad('playlist count ' + temp);
+    if (ind + 1 > n) return bad('truncated at the includes count');
+    temp = num(ind++);
+    if (temp < 0 || temp > MAXINCFILES || (ind += temp) > n) return bad('includes count ' + temp);
+    if (ind + 1 > n) return bad('truncated at the actions count');
+    let count = num(ind++);
+    if (count < 0 || count > MAXACTIONS) return bad('actions count ' + count);
+    if (selAction >= count) return bad('selected action ' + selAction + ' >= ' + count + ' actions');
+    for (let i = 0; i < count; i++) {
+      if ((ind += 2) > n) return bad('truncated in action ' + i + ' header');
+      if (ind + 1 > n) return bad('truncated at action ' + i + ' code length');
+      const linesCount = num(ind++);
+      if (linesCount < 0 || (ind + 2 * linesCount) > n) return bad('code length ' + linesCount + ' in action ' + i);
+      for (let j = 0; j < linesCount; j++) {
+        ++ind;
+        if (num(ind++) < 0) return bad('negative line number in action ' + i);
+      }
+      if (ind + 1 > n) return bad('truncated at action ' + i + ' location');
+      if (num(ind++) < 0) return bad('negative location in action ' + i);
+      if (++ind > n) return bad('truncated at action ' + i + ' source index');
+      if (ind + 1 > n) return bad('truncated at action ' + i + ' start line');
+      if (num(ind++) < 0) return bad('negative start line in action ' + i);
+      if (++ind > n) return bad('truncated at action ' + i + ' manage-lines flag');
+    }
+    if (ind + 1 > n) return bad('truncated at the objects count');
+    temp = num(ind++);
+    if (temp < 0 || temp > MAXOBJECTS) return bad('objects count ' + temp);
+    if (selObject >= temp) return bad('selected object ' + selObject + ' >= ' + temp + ' objects');
+    if ((ind += 2 * temp) > n) return bad('truncated inside the objects');
+    if (ind + 1 > n) return bad('truncated at the variables count');
+    count = num(ind++);
+    if (count < 0) return bad('variables count ' + count);
+    let lastInd = -1;
+    for (let i = 0; i < count; i++) {
+      if (ind + 1 > n) return bad('truncated at the slot of variable ' + i);
+      temp = num(ind++);
+      if (temp <= lastInd) return bad('variable ' + i + ' sits in slot ' + temp + ', which is not above the previous slot ' + lastInd);
+      if (temp >= VARSCOUNT) return bad('variable ' + i + ' sits in slot ' + temp + ' (limit ' + VARSCOUNT + ')');
+      lastInd = temp;
+      if (++ind > n) return bad('truncated at the name of variable ' + i);
+      if (ind + 1 > n) return bad('truncated at the value count of variable ' + i);
+      temp = num(ind++);
+      if (temp < 0 || (ind += 2 * temp) > n) return bad('value count ' + temp + ' on variable ' + i);
+      if (ind + 1 > n) return bad('truncated at the index count of variable ' + i);
+      temp = num(ind++);
+      if (temp < 0 || (ind += 2 * temp) > n) return bad('index count ' + temp + ' on variable ' + i);
+    }
+    // The legacy gate itself stops here — unlike modern (game.c:493) it does
+    // NOT require the walk to land on the trailing empty line. The writer
+    // still emits one, because qspCodeWriteVal appends the delimiter after
+    // every field (coding.c), so this is checked as a writer invariant rather
+    // than as an engine rule.
+    return { ok: true, endIndex: ind, lineCount: n, endsWhereExpected: ind === n - 1 && lines[n - 1] === '' };
+  }
+
+  return { checkLegacySav: checkLegacySav };
+}));
+
+// The converter's public entry points: bytes in, bytes out, one per direction.
+//
+//   convertBuffer({ savBytes, qspBytes, qspName })        classic -> modern
+//   reverseConvertBuffer({ savBytes, qspBytes, qspName,   modern  -> classic
+//                          locationAs })                  (WP-63)
+//
+// No `fs`, no paths, no node built-ins — everything above this line in the
+// stack (the CLI, the launcher, the theme's Web Worker) supplies the bytes and
+// decides what to do with the result. That is the point of the split: one
+// byte-for-byte verified library runs unchanged in the webview, so converting
+// an old save needs no Node.js on the player's machine.
+//
+// It throws, it never returns a half-conversion. Every throw is one of the four
+// typed errors in `errors.js`, each carrying a sentence a player can act on and
+// a `kind` that survives a `postMessage` out of a worker.
+//
+// The order of the checks is deliberate and must not be rearranged — the exact
+// message an adversarial input produces is asserted by the test gates:
+//   1. is it a QSP save at all (header marker only);
+//   2. is it ALREADY modern — answered before the body is walked, so a modern
+//      file gets "you do not need this" instead of a parse error from deep
+//      inside a layout it never had;
+//   3. the strict legacy walk;
+//   4. the `.qsp` location table + CRC;
+//   5. the rewrite;
+//   6. libqsp's OWN acceptance gate over the finished bytes, transcribed
+//      independently of the writer (modern-check.js) — a save that fails to
+//      load after the player was told it converted is the failure mode this
+//      converter exists to prevent.
+(function (factory) {
+  'use strict';
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(
+      require('./codec'), require('./errors'), require('./legacy-sav'),
+      require('./qsp-game'), require('./convert'), require('./modern-check'),
+      require('./modern-sav'), require('./reverse'), require('./legacy-check')
+    );
+  } else {
+    var g = typeof globalThis !== 'undefined' ? globalThis : self;
+    var ns = g.GLSavConvert || (g.GLSavConvert = {});
+    // The last three are the REVERSE direction (WP-63). They joined the
+    // browser bundle in WP-66 (`SAV_CONVERT_JS` in server.rs,
+    // `SAV_CONVERT_FILES` in serve.py) — but the guard below stays: a HOST
+    // that assembles its own bundle and leaves them out gets one sentence
+    // instead of a crash on a property of undefined.
+    var api = factory(ns.codec, ns.errors, ns.legacySav, ns.qspGame, ns.convert, ns.modernCheck,
+      ns.modernSav, ns.reverse, ns.legacyCheck);
+    for (var k in api) if (Object.prototype.hasOwnProperty.call(api, k)) ns[k] = api[k];
+  }
+}(function (codec, errors, legacySav, qspGame, convert, modernCheck, modernSav, reverse, legacyCheck) {
+  'use strict';
+
+  var MODERN_VER = '5.9.0';
+
+  /** Engine stamp from a QSP save, or null if the file is not one at all. */
+  function readEngineStamp(bytes) {
+    if (bytes.length < 4) return null;
+    var ucs2 = bytes[1] === 0;
+    var end = Math.min(bytes.length, ucs2 ? 128 : 64);
+    var head = codec.decodeRange(bytes, ucs2, 0, end).split('\r\n');
+    if (head[0] !== 'QSPSAVEDGAME') return null;
+    return head.length > 1 ? head[1] : '';
+  }
+
+  /**
+   * Numeric dotted-version compare; a non-numeric stamp sorts below everything.
+   *
+   * Numeric on purpose: the engine's own gate is a raw string compare, under
+   * which "5.10.0" would sort below "5.9.0". Inheriting that would make a
+   * future save look legacy and offer it for conversion.
+   */
+  function compareVersions(a, b) {
+    var pa = String(a).split('.').map(function (x) { return parseInt(x, 10); });
+    var pb = String(b).split('.').map(function (x) { return parseInt(x, 10); });
+    if (pa.some(function (x) { return isNaN(x); })) return -1;
+    for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+      var d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d < 0 ? -1 : 1;
+    }
+    return 0;
+  }
+
+  /**
+   * Convert one legacy save.
+   *
+   * @param opts.savBytes  the classic `.sav` (Uint8Array / Buffer / ArrayBuffer)
+   * @param opts.qspBytes  the target game file's bytes
+   * @param opts.qspName   what to call the game file in messages (a path or a
+   *                       file name — never read, only printed)
+   * @returns { outBytes: Uint8Array, report }
+   */
+  function convertBuffer(opts) {
+    var o = opts || {};
+    var savBytes = codec.toBytes(o.savBytes);
+    if (!savBytes) throw new errors.SavFormatError('the save was not handed over as bytes');
+
+    var stamp = readEngineStamp(savBytes);
+    if (stamp === null) {
+      throw new errors.SavFormatError('not a QSP save file — it has no "QSPSAVEDGAME" header');
+    }
+    if (compareVersions(stamp, MODERN_VER) >= 0) {
+      throw new errors.AlreadyModernError('this save is already in the modern format (engine ' + stamp +
+        ') — it does not need converting; import it directly.');
+    }
+
+    var parsed = legacySav.parseLegacySav(savBytes);
+    var game = qspGame.readGameBuffer(o.qspBytes, o.qspName);
+    var written = convert.toModern(parsed, game);
+
+    var gate = modernCheck.checkModernSav(written.buffer);
+    if (!gate.ok) {
+      throw new errors.ConvertError('the converted save would be rejected by the game engine (' +
+        gate.reason + '). Nothing was written. Please report this file — it is a converter bug.');
+    }
+
+    var report = { inputBytes: savBytes.length, outputBytes: written.buffer.length };
+    for (var k in written.report) {
+      if (Object.prototype.hasOwnProperty.call(written.report, k)) report[k] = written.report[k];
+    }
+    return { outBytes: written.buffer, report: report };
+  }
+
+  /**
+   * Convert one MODERN save back to the classic format (WP-63).
+   *
+   * The mirror of `convertBuffer`, same shape, same discipline: bytes in,
+   * bytes out, typed refusals, and the destination engine's OWN acceptance
+   * gate run over the finished file before it is handed back.
+   *
+   * @param opts.savBytes    the modern `.sav`
+   * @param opts.qspBytes    the bytes of the .qsp the CLASSIC player will open
+   * @param opts.qspName     what to call that file in messages
+   * @param opts.locationAs  'name' (default, what Qqsp 1.9 reads) or 'index'
+   *                         (what a stock QSP 5.7.0 player reads) — see
+   *                         reverse.js, note 1
+   * @returns { outBytes: Uint8Array, report }
+   */
+  function reverseConvertBuffer(opts) {
+    if (!modernSav || !reverse || !legacyCheck) {
+      throw new errors.ConvertError('the reverse converter (modern -> classic) is not part of ' +
+        'this build — it runs from tools/sav-convert/reverse.js on the command line.');
+    }
+    var o = opts || {};
+    var savBytes = codec.toBytes(o.savBytes);
+    if (!savBytes) throw new errors.SavFormatError('the save was not handed over as bytes');
+
+    var stamp = readEngineStamp(savBytes);
+    if (stamp === null) {
+      throw new errors.SavFormatError('not a QSP save file — it has no "QSPSAVEDGAME" header');
+    }
+    if (compareVersions(stamp, MODERN_VER) < 0) {
+      throw new errors.AlreadyLegacyError('this save is already in the classic format (engine ' + stamp +
+        ') — the classic player opens it as it is.');
+    }
+
+    var parsed = modernSav.parseModernSav(savBytes);
+    var game = qspGame.readGameBuffer(o.qspBytes, o.qspName);
+    var written = reverse.toLegacy(parsed, game, { locationAs: o.locationAs });
+
+    var gate = legacyCheck.checkLegacySav(written.buffer);
+    if (!gate.ok) {
+      throw new errors.ConvertError('the converted save would be rejected by the classic engine (' +
+        gate.reason + '). Nothing was written. Please report this file — it is a converter bug.');
+    }
+    if (!gate.endsWhereExpected) {
+      throw new errors.ConvertError('the converted save does not end where a 5.7.0 body should ' +
+        '(line ' + gate.endIndex + ' of ' + gate.lineCount + '). Nothing was written — it is a converter bug.');
+    }
+
+    var report = { inputBytes: savBytes.length, outputBytes: written.buffer.length };
+    for (var k in written.report) {
+      if (Object.prototype.hasOwnProperty.call(written.report, k)) report[k] = written.report[k];
+    }
+    return { outBytes: written.buffer, report: report };
+  }
+
+  return {
+    convertBuffer: convertBuffer,
+    reverseConvertBuffer: reverseConvertBuffer,
+    readEngineStamp: readEngineStamp,
+    compareVersions: compareVersions,
+    MODERN_VER: MODERN_VER,
+    ConverterError: errors.ConverterError,
+    SavFormatError: errors.SavFormatError,
+    ConvertError: errors.ConvertError,
+    AlreadyModernError: errors.AlreadyModernError,
+    AlreadyLegacyError: errors.AlreadyLegacyError,
+    GameFileError: errors.GameFileError,
+  };
+}));
+
+</script>
+
+<script id="gl-worker-tail" type="text/plain">
+// Worker tail. The core above is concatenated ahead of this block into one
+// Blob, so the worker holds exactly the code the page holds.
+self.onmessage = function (e) {
+  var m = e.data || {};
+  try {
+    var api = self.GLSavConvert;
+    var req = { savBytes: m.savBytes, qspBytes: m.qspBytes, qspName: m.qspName };
+    var out;
+    if (m.op === 'reverse') {
+      req.locationAs = m.locationAs;
+      out = api.reverseConvertBuffer(req);
+    } else {
+      out = api.convertBuffer(req);
+    }
+    var buf = out.outBytes.buffer.byteLength === out.outBytes.byteLength
+      ? out.outBytes.buffer : out.outBytes.slice().buffer;
+    self.postMessage({ ok: true, bytes: buf, report: out.report }, [buf]);
+  } catch (err) {
+    // An Error subclass does not survive a structured clone: send the sentence
+    // and the kind as plain data.
+    self.postMessage({
+      ok: false,
+      kind: (err && err.kind) || 'error',
+      error: (err && err.message) || String(err)
+    });
+  }
+};
+</script>
+
+<script>
+(function () {
+  'use strict';
+  var api = window.GLSavConvert;
+  var savFile = null, savBytes = null, qspFile = null;
+  var dir = null;                 // 'forward' | 'reverse'
+  var lastUrl = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var elDir = $('direction'), elMsg = $('msg'), elOut = $('out'),
+      elRep = $('report'), elGo = $('go');
+
+  // Which lead-in a refusal gets, by the core's own `kind`. Same wording the
+  // command line prints; a stack trace is never shown.
+  var LEAD = {
+    'sav-format': 'This is not a save this converter can read',
+    'convert': 'This save cannot be converted',
+    'already-modern': 'Nothing to do',
+    'already-legacy': 'Nothing to do',
+    'game-file': 'That game file cannot be read'
+  };
+
+  function say(text, bad) {
+    elMsg.textContent = text || '';
+    elMsg.className = bad ? 'bad' : '';
+  }
+  function clearResult() {
+    elOut.textContent = '';
+    elRep.textContent = '';
+    if (lastUrl) { URL.revokeObjectURL(lastUrl); lastUrl = null; }
+  }
+  function kb(n) { return (n / 1024).toFixed(1) + ' KB'; }
+
+  function describe() {
+    clearResult();
+    if (!savBytes) {
+      elDir.textContent = 'Pick a save file to see which way it will be converted.';
+      elGo.disabled = true;
+      return;
+    }
+    var stamp = api.readEngineStamp(savBytes);
+    if (stamp === null) {
+      dir = null;
+      elDir.textContent = 'That file is not a QSP save — it has no "QSPSAVEDGAME" header.';
+      elGo.disabled = true;
+      return;
+    }
+    dir = api.compareVersions(stamp, api.MODERN_VER) >= 0 ? 'reverse' : 'forward';
+    var html = dir === 'forward'
+      ? 'This save was written by engine <strong>' + stamp + '</strong> (classic). ' +
+        'It will be converted to the <strong>modern</strong> format.'
+      : 'This save was written by engine <strong>' + stamp + '</strong> (modern). ' +
+        'It will be converted to the <strong>classic 5.7.0</strong> format.';
+    elDir.innerHTML = html;
+    if (dir === 'reverse') {
+      var lab = document.createElement('label');
+      lab.className = 'opt';
+      lab.innerHTML = '<input type="checkbox" id="locidx"> The classic player is a stock ' +
+        'QSP 5.7.0 player, which reads the location as a number. Leave this off for Qqsp 1.9.';
+      elDir.appendChild(lab);
+    }
+    elGo.disabled = !qspFile;
+  }
+
+  function pickSav(file) {
+    savFile = file; savBytes = null;
+    $('sav-picked').textContent = file ? file.name + '  (' + kb(file.size) + ')' : '';
+    say('');
+    if (!file) { describe(); return; }
+    file.arrayBuffer().then(function (buf) {
+      savBytes = new Uint8Array(buf);
+      describe();
+    }).catch(function () {
+      say('That save file could not be read from disk.', true);
+    });
+  }
+  function pickQsp(file) {
+    qspFile = file;
+    $('qsp-picked').textContent = file
+      ? file.name + '  (' + (file.size / 1048576).toFixed(1) + ' MB)' : '';
+    elGo.disabled = !(savBytes && dir && qspFile);
+  }
+
+  function wire(boxId, inputId, onFile, ext) {
+    var box = $(boxId), input = $(inputId);
+    input.addEventListener('change', function () { onFile(input.files[0] || null); });
+    box.addEventListener('dragover', function (e) { e.preventDefault(); box.classList.add('over'); });
+    box.addEventListener('dragleave', function () { box.classList.remove('over'); });
+    box.addEventListener('drop', function (e) {
+      e.preventDefault();
+      box.classList.remove('over');
+      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+      if (ext && f.name.toLowerCase().slice(-ext.length) !== ext) {
+        say('That does not look like a ' + ext + ' file.', true);
+        return;
+      }
+      onFile(f);
+    });
+  }
+  wire('drop-sav', 'sav', pickSav, '.sav');
+  wire('drop-qsp', 'qsp', pickQsp, '.qsp');
+
+  /** Build a worker out of the same core the page runs. Null if it cannot. */
+  function makeWorker() {
+    try {
+      var src = document.getElementById('gl-core').textContent + '\n' +
+        document.getElementById('gl-worker-tail').textContent;
+      var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      var w = new Worker(url);
+      URL.revokeObjectURL(url);
+      return w;
+    } catch (e) {
+      // Not every browser will start a worker from a blob: URL, and a page
+      // opened straight from disk has an opaque origin some of them refuse
+      // outright. The page then does the work itself: slower, and it freezes
+      // for a moment, but a player who keeps their save beats a dead button.
+      return null;
+    }
+  }
+
+  function finish(bytes, report, where) {
+    var base = savFile.name.replace(/\.sav$/i, '');
+    var name = base + (dir === 'forward' ? '-modern.sav' : '-classic.sav');
+    lastUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    var a = document.createElement('a');
+    a.href = lastUrl;
+    a.download = name;
+    a.id = 'download';
+    a.textContent = 'Download ' + name;
+    elOut.appendChild(a);
+    say('Converted ' + kb(report.inputBytes) + ' → ' + kb(report.outputBytes) +
+      '  (' + where + ').');
+    var rows = [
+      ['engine stamp', report.engineVersionIn + ' → ' + report.engineVersionOut],
+      ['location', report.location],
+      ['game checksum', report.qstCRCIn + ' → ' + report.qstCRCOut],
+      ['contents', report.variables + ' variables, ' + report.actions + ' actions, ' +
+        report.objects + ' objects']
+    ];
+    if (report.mods && report.mods.length) rows.push(['mods named in the save', report.mods.join(', ')]);
+    if (report.notes && report.notes.length) rows.push(['notes', report.notes.join('\n')]);
+    var t = document.createElement('table');
+    rows.forEach(function (r) {
+      var tr = t.insertRow();
+      tr.insertCell().textContent = r[0];
+      tr.insertCell().textContent = r[1];
+    });
+    elRep.appendChild(t);
+    elGo.disabled = false;
+  }
+
+  function fail(kind, message) {
+    clearResult();
+    say((LEAD[kind] || 'Conversion failed') + ':\n' + message, true);
+    elGo.disabled = false;
+  }
+
+  elGo.addEventListener('click', function () {
+    if (!savBytes || !qspFile || !dir) return;
+    clearResult();
+    elGo.disabled = true;
+    say('Reading the game file …');
+    var locBox = document.getElementById('locidx');
+    var locationAs = (dir === 'reverse' && locBox && locBox.checked) ? 'index' : 'name';
+
+    qspFile.arrayBuffer().then(function (qspBuf) {
+      say('Converting …');
+      var w = makeWorker();
+      var req = {
+        op: dir === 'reverse' ? 'reverse' : 'convert',
+        savBytes: savBytes.buffer.slice(0),
+        qspBytes: qspBuf,
+        qspName: qspFile.name,
+        locationAs: locationAs
+      };
+      if (w) {
+        window.__glPath = 'worker';
+        w.onmessage = function (e) {
+          var m = e.data || {};
+          w.terminate();
+          if (m.ok) finish(new Uint8Array(m.bytes), m.report, 'in a background worker');
+          else fail(m.kind, m.error);
+        };
+        w.onerror = function () {
+          w.terminate();
+          fail('error', 'The background worker stopped before it finished. ' +
+            'Reload the page and try again.');
+        };
+        w.postMessage(req, [req.savBytes, req.qspBytes]);
+      } else {
+        runHere(req);
+      }
+    }).catch(function () {
+      fail('game-file', 'The game file could not be read from disk.');
+    });
+  });
+
+  /** The main-thread fallback: the same core, called directly. */
+  function runHere(req) {
+    window.__glPath = 'main';
+    setTimeout(function () {
+      try {
+        var out = req.op === 'reverse' ? api.reverseConvertBuffer(req) : api.convertBuffer(req);
+        finish(out.outBytes, out.report, 'on the page');
+      } catch (err) {
+        fail((err && err.kind) || 'error', (err && err.message) || String(err));
+      }
+    }, 0);
+  }
+
+  describe();
+}());
+</script>
+</body>
+</html>
