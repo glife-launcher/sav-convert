@@ -70,6 +70,10 @@
         qspName: msg.qspName || 'the game file',
       };
       if (reverse) req.locationAs = msg.locationAs;
+      // WP-242: the host may ask for the 5.9.5 layout. Passed through
+      // untouched — undefined means the 5.9.0 default, which is what the
+      // launcher's own player reads.
+      else if (msg.target) req.target = msg.target;
       var out = reverse ? api.reverseConvertBuffer(req) : api.convertBuffer(req);
       timings.convert = Date.now() - t2;
       timings.total = Date.now() - t0;

@@ -1,11 +1,17 @@
 #!/usr/bin/env node
-// Convert a MODERN QSP save (engine 5.9.0 — the launcher's player) back into
-// the CLASSIC 5.7.0 format the desktop players understand. The mirror of
-// `convert.js`; WP-63.
+// Convert a MODERN QSP save back into the CLASSIC 5.7.0 format the desktop
+// players understand. The mirror of `convert.js`; WP-63.
+//
+// Both modern layouts are read — 5.9.0 (the launcher's own player) and 5.9.5
+// (the new Qqsp; WP-242). Which one a file is in comes off its own engine
+// stamp, exactly as the engine decides it, so nothing has to be said on the
+// command line; `--target` is only there to say what you EXPECT and be told
+// when the file disagrees.
 //
 //   node reverse.js <in.sav> <out.sav> --qsp <game.qsp>
 //   node reverse.js <in.sav> <out.sav> --qsp <game.qsp> --loc-index
 //   node reverse.js <in.sav> <out.sav> --qsp <game.qsp> --json
+//   node reverse.js <in.sav> <out.sav> --qsp <game.qsp> --target 5.9.5
 //
 // `--qsp` must point at the .qsp the CLASSIC player will open the save with.
 // It is needed for three things: to prove the location the save is standing in
@@ -42,13 +48,18 @@ const { SavFormatError } = require('./lib/modern-sav');
 const { ConvertError } = require('./lib/reverse');
 const { reverseConvertBuffer } = require('./lib/index');
 
-const USAGE = 'usage: node reverse.js <in.sav> <out.sav> --qsp <game.qsp> [--loc-index] [--json]';
+const USAGE = 'usage: node reverse.js <in.sav> <out.sav> --qsp <game.qsp> [--loc-index] [--json]\n' +
+  '                       [--target 5.9.0|5.9.5]\n' +
+  '  --target  the modern layout you EXPECT the input to be in. The layout is\n' +
+  '            read off the save\'s own engine stamp either way; this only turns\n' +
+  '            a surprise into a refusal instead of a conversion.';
 
 function parseArgs(argv) {
   const positional = [];
   let qsp = null;
   let json = false;
   let locationAs = 'name';
+  let target = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--qsp') {
@@ -56,6 +67,9 @@ function parseArgs(argv) {
       if (!qsp) throw new Error('--qsp needs a path to the game .qsp file');
     } else if (a === '--json') {
       json = true;
+    } else if (a === '--target') {
+      target = argv[++i];
+      if (!target) throw new Error('--target needs an engine version (5.9.0 or 5.9.5)');
     } else if (a === '--loc-index') {
       locationAs = 'index';
     } else if (a.startsWith('-')) {
@@ -68,11 +82,11 @@ function parseArgs(argv) {
   if (!qsp) throw new Error('--qsp <game.qsp> is required: the converter needs the game file the\n' +
     'CLASSIC player will open, to check that the save\'s location exists in it and to stamp\n' +
     'the right game checksum.\n' + USAGE);
-  return { input: positional[0], output: positional[1], qsp, json, locationAs };
+  return { input: positional[0], output: positional[1], qsp, json, locationAs, target };
 }
 
 /** Convert one file. Throws Error with a player-readable message on refusal. */
-function reverseFile({ input, output, qsp, locationAs }) {
+function reverseFile({ input, output, qsp, locationAs, target }) {
   if (!fs.existsSync(input)) throw new Error('no such save file: ' + input);
   if (fs.existsSync(output)) {
     throw new Error('refusing to overwrite an existing file: ' + output +
@@ -96,6 +110,10 @@ function reverseFile({ input, output, qsp, locationAs }) {
   }
 
   const { outBytes, report } = reverseConvertBuffer({ savBytes: bytes, qspBytes, qspName: qsp, locationAs });
+  if (target && report.target !== target) {
+    throw new Error('this save is in the ' + report.target + ' layout, not the ' + target +
+      ' one you asked for (its engine stamp reads ' + report.engineVersionIn + ')');
+  }
 
   const tmp = path.join(outDir, '.' + path.basename(output) + '.tmp-' + process.pid);
   fs.writeFileSync(tmp, outBytes);

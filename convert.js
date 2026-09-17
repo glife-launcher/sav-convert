@@ -4,6 +4,7 @@
 //
 //   node convert.js <in.sav> <out.sav> --qsp <game.qsp>
 //   node convert.js <in.sav> <out.sav> --qsp <game.qsp> --json
+//   node convert.js <in.sav> <out.sav> --qsp <game.qsp> --target 5.9.5
 //
 // This is a THIN WRAPPER. All the format work lives in `lib/`, which is a
 // byte-level core with no `fs` and no node built-ins in it — the same files run
@@ -30,7 +31,10 @@ const { readGameBuffer } = require('./lib/qsp-game');
 const { ConvertError, modPathParts, modsNote } = require('./lib/convert');
 const { convertBuffer } = require('./lib/index');
 
-const USAGE = 'usage: node convert.js <in.sav> <out.sav> --qsp <game.qsp> [--json]';
+const USAGE = 'usage: node convert.js <in.sav> <out.sav> --qsp <game.qsp> [--json] [--target 5.9.0|5.9.5]\n' +
+  '  --target  which modern engine to write for. 5.9.0 (the default) is what the\n' +
+  '            launcher\'s own player runs; 5.9.5 is the new Qqsp. A save written\n' +
+  '            for one is refused by the other.';
 
 /**
  * Read a compiled game file from disk. The core takes bytes; this is the one
@@ -51,11 +55,15 @@ function parseArgs(argv) {
   const positional = [];
   let qsp = null;
   let json = false;
+  let target = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--qsp') {
       qsp = argv[++i];
       if (!qsp) throw new Error('--qsp needs a path to the game .qsp file');
+    } else if (a === '--target') {
+      target = argv[++i];
+      if (!target) throw new Error('--target needs an engine version (5.9.0 or 5.9.5)');
     } else if (a === '--json') {
       json = true;
     } else if (a.startsWith('-')) {
@@ -67,11 +75,11 @@ function parseArgs(argv) {
   if (positional.length !== 2) throw new Error(USAGE);
   if (!qsp) throw new Error('--qsp <game.qsp> is required: the converter needs the game file to\n' +
     'check that the save\'s location still exists and to stamp the right game checksum.\n' + USAGE);
-  return { input: positional[0], output: positional[1], qsp, json };
+  return { input: positional[0], output: positional[1], qsp, json, target };
 }
 
 /** Convert one file. Throws Error with a player-readable message on refusal. */
-function convertFile({ input, output, qsp }) {
+function convertFile({ input, output, qsp, target }) {
   if (!fs.existsSync(input)) throw new Error('no such save file: ' + input);
   if (fs.existsSync(output)) {
     throw new Error('refusing to overwrite an existing file: ' + output +
@@ -94,7 +102,7 @@ function convertFile({ input, output, qsp }) {
     throw new Error('cannot read the game file "' + qsp + '" (' + e.code + ')');
   }
 
-  const { outBytes, report } = convertBuffer({ savBytes: bytes, qspBytes, qspName: qsp });
+  const { outBytes, report } = convertBuffer({ savBytes: bytes, qspBytes, qspName: qsp, target });
 
   // WP-154 (B-080) — a modded playthrough is NAMED here too, so the player
   // learns before loading it why the game may come up on its title screen.

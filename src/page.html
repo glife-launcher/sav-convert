@@ -30,6 +30,8 @@
                padding: 12px 16px; margin: 16px 0; font-size: 14px; }
   #direction strong { color: var(--accent); }
   label.opt { display: block; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  label.opt select { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel);
+                     border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
   button { font: inherit; padding: 10px 20px; border-radius: 8px; border: 1px solid var(--line);
            background: var(--accent); color: #fff; cursor: pointer; }
   button[disabled] { opacity: .45; cursor: default; }
@@ -96,6 +98,8 @@ self.onmessage = function (e) {
       req.locationAs = m.locationAs;
       out = api.reverseConvertBuffer(req);
     } else {
+      // Which modern engine to write for; absent means the 5.9.0 default.
+      if (m.target) req.target = m.target;
       out = api.convertBuffer(req);
     }
     var buf = out.outBytes.buffer.byteLength === out.outBytes.byteLength
@@ -167,6 +171,16 @@ self.onmessage = function (e) {
       : 'This save was written by engine <strong>' + stamp + '</strong> (modern). ' +
         'It will be converted to the <strong>classic 5.7.0</strong> format.';
     elDir.innerHTML = html;
+    if (dir === 'forward') {
+      // The two modern engines are mutually unreadable, so the player the save
+      // is going to has to be named. 5.9.0 first, and therefore the default.
+      var tlab = document.createElement('label');
+      tlab.className = 'opt';
+      tlab.innerHTML = 'Modern player: <select id="target">' +
+        '<option value="5.9.0">qSpider / launcher (5.9.0)</option>' +
+        '<option value="5.9.5">the new Qqsp (libqsp 5.9.5)</option></select>';
+      elDir.appendChild(tlab);
+    }
     if (dir === 'reverse') {
       var lab = document.createElement('label');
       lab.className = 'opt';
@@ -278,6 +292,10 @@ self.onmessage = function (e) {
     say('Reading the game file …');
     var locBox = document.getElementById('locidx');
     var locationAs = (dir === 'reverse' && locBox && locBox.checked) ? 'index' : 'name';
+    // The reverse direction needs no such choice: the layout of a modern save
+    // comes off its own engine stamp.
+    var tgtBox = document.getElementById('target');
+    var target = (dir === 'forward' && tgtBox) ? tgtBox.value : null;
 
     qspFile.arrayBuffer().then(function (qspBuf) {
       say('Converting …');
@@ -287,7 +305,8 @@ self.onmessage = function (e) {
         savBytes: savBytes.buffer.slice(0),
         qspBytes: qspBuf,
         qspName: qspFile.name,
-        locationAs: locationAs
+        locationAs: locationAs,
+        target: target
       };
       if (w) {
         window.__glPath = 'worker';

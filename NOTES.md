@@ -32,7 +32,8 @@ Two things follow from that:
    host. No build step, no install, no network.
 2. Drop in the `.sav` and the `.qsp` the save belongs to.
 3. The page reads the save's own engine stamp and says which way it will
-   convert, before you press anything.
+   convert, before you press anything. For a classic save it also asks which
+   **modern player** the file is for — see *Two modern targets* below.
 4. Press **Convert** and save the file it offers.
 
 The game file is needed for three things: to prove the location the save is
@@ -53,6 +54,7 @@ Node 18 or newer, no dependencies:
 
 ```
 node convert.js <in.sav> <out.sav> --qsp <game.qsp>            classic -> modern
+node convert.js <in.sav> <out.sav> --qsp <game.qsp> --target 5.9.5
 node reverse.js <in.sav> <out.sav> --qsp <game.qsp>            modern  -> classic
 node reverse.js <in.sav> <out.sav> --qsp <game.qsp> --loc-index
 ```
@@ -64,7 +66,8 @@ behind: anything that cannot be translated faithfully is an error with a
 sentence you can act on.
 
 `--loc-index` picks how the location is spelled in a classic save; see the
-second trap below.
+second trap below. `--target` picks which modern engine `convert.js` writes
+for; on `reverse.js` it only asserts which one the input is in.
 
 ### The library
 
@@ -75,6 +78,7 @@ const { outBytes, report } = convertBuffer({
   savBytes,          // Uint8Array / ArrayBuffer — the save
   qspBytes,          // Uint8Array / ArrayBuffer — the game file
   qspName,           // only ever printed in messages, never opened
+  target,            // optional: '5.9.0' (default) | '5.9.5' — see below
 });
 ```
 
@@ -131,6 +135,124 @@ disagree: `reverse.js` writes the NAME by default (Qqsp 1.9) and the ORDINAL
 with `--loc-index` (stock 5.7.0 players). Pick the wrong one and the save still
 loads with all of its state — the player just starts in the wrong place. The
 CLI prints which one it wrote.
+
+## Two modern targets: libqsp 5.9.0 and libqsp 5.9.5
+
+"Modern" is two formats. **5.9.0** is the engine qspider and the players built
+on it run; **5.9.5** is the engine the new Qqsp is built on, and it changed the
+save layout. The forward direction therefore takes a target:
+
+```js
+convertBuffer({ savBytes, qspBytes, qspName })                    // 5.9.0, the default
+convertBuffer({ savBytes, qspBytes, qspName, target: '5.9.5' })   // the new Qqsp
+```
+
+`--target 5.9.0|5.9.5` on `convert.js`, and the **Modern player** control on
+the page. `'5.9.0'` is the default and its bytes are unchanged from every
+earlier version of this converter.
+
+`reverseConvertBuffer` reads **both** layouts and needs no option: which one a
+file is in comes off its own engine stamp, compared numerically (a raw string
+compare would sort `5.10.0` below `5.9.4` one day). `reverse.js --target` only
+asserts what you expected and refuses a surprise.
+
+**The two are mutually unreadable, by design.** 5.9.5's `QSP_GAMEMIN_VER` is
+`5.9.4` (`CMakeLists.txt:4`), so it refuses a 5.9.0-stamped save on line 2
+before it looks at anything else. Measured: the 5.9.5 engine answers
+`error=15 Can't load file!` and nothing more.
+
+### What changed between the two
+
+All of it lives in ONE table, `MODERN_TARGETS` in `lib/codec.js`; every other
+file reads it. 5.9.0 = `QSPFoundation/qsp` @ `9f4f29f9`, 5.9.5 = tag `5.9.5`
+(`0445921b`). Line numbers are that engine's own sources.
+
+| | 5.9.0 | 5.9.5 |
+|---|---|---|
+| version / minimum | `5.9.0` / `5.9.0` (`CMakeLists.txt:2,4`) | `5.9.5` / **`5.9.4`** (`CMakeLists.txt:2,4`) |
+| **line 3, the CRC** | seed `0`, SIGNED `>>`, `^ 0xD202EF8D` per byte (`game.c:83-91`) | plain CRC-32B: seed `~0`, logical `>>`, complemented on the way out (`game.c:74-82`) |
+| header 11..14 | four window flags (`game.c:313-316`) | ONE `qspCurWindowsDisplayState` bitmask on line 11 (`game.c:328`, bits `bindings/qsp.h:44-50`) |
+| the load check opens at | line 16 (`game.c:403`) | line 12 (`game.c:415`) |
+| action record | `Image, Desc` (`game.c:327-328`) | `Desc, Image` (`game.c:340-341`) |
+| object record | `Image, Desc` (`game.c:341-342`) | `Name, Image` (`game.c:354-355`; `objects.h:16-19` has no `Desc` member any more) |
+| object groups | — | a whole new section after the objects: `Name, Desc, Image, UpdatedFields, ObjsCount` (`game.c:356-364`, read `game.c:586-594`, checked `game.c:471-485`) |
+| global buckets | 1024 (`variables.h:26`) | **512** (`variables.h:17`) |
+| max per bucket | 50 (`variables.h:27`) | **32** (`variables.h:19`) |
+| name hash | `7`, then `*31 + low byte` (`variables.c:112-115`) | IDENTICAL, as `qspGetNameHash` (`variables.c:86-94`) |
+| value type codes | TUPLE 0, NUM 1, STR 2, CODE 3, VARREF 4, UNDEF 5 (`bindings/qsp.h:87-92`) | **BOOL inserted at 2**: TUPLE 0, NUM 1, BOOL 2, STR **3**, CODE **4**, VARREF **5**, UNDEF **6** (`bindings/qsp.h:82-88`) |
+| type prefixes stripped from a name | `$`, `%` (`variables.c:102-105`) | `$`, `%`, `#` (`text.c:39` + `variables.c:363-365`) |
+
+Unchanged, and re-read rather than assumed: the container and the ±5 shift
+(`coding.c`), the variant encoding itself — a type line, then one payload line,
+except a tuple, which is a count and that many nested variants
+(`coding.c:340`/`:363`) — the `$` prefix on a string index key (`variant.h:25`
+→ `declarations.h:63`, both written by `qspAppendVariantToIndexString`), and the
+500/100/50/1000 limits.
+
+Two of those have teeth:
+
+* **the type codes must be REMAPPED, not copied.** Every stored value carries
+  its own code, and under 5.9.5 a `2` is a BOOL, whose base type is a NUMBER
+  (`bindings/qsp.h:117`). A string written as `2` therefore comes back out of
+  the engine as `0` — the file opens, and the text is gone.
+* **line 3 must carry the TARGET engine's checksum.** The two engines compute
+  different numbers over the same bytes: one game file measured
+  `-651164383` under 5.9.0 and `-2055507245` under 5.9.5. A game that sets
+  `DEBUG` never reaches the comparison (`game.c:421-424`), so a player may never
+  see it — but a headless host that has not run the game's start code does, and
+  the only symptom is `Can't load file!`.
+
+One judgement call, marked as such in the code: a classic save has no `MAIN` or
+`VIEW` window flag, so the 5.9.5 bitmask is written as `MAIN | (the four the
+classic file carried)`, which is the set a fresh game starts with
+(`game.c:145`, `common.c:61`).
+
+A 5.9.5 save costs nothing measurable: the same conversion, about 3 KB smaller
+on a ~700 KB save (512 bucket lines instead of 1024).
+
+### The native gate
+
+`lib/modern-check.js` walks every 5.9.5 file before it is handed back, exactly
+as it does for 5.9.0. On top of that, `native-check/` makes the real engine
+answer:
+
+```sh
+# 1. build libqsp 5.9.5 (tag 5.9.5), with a system oniguruma:
+cmake -S <qsp-5.9.5> -B <qsp-5.9.5>/build -DCMAKE_BUILD_TYPE=Release \
+      -DUSE_INSTALLED_ONIGURUMA=ON -Doniguruma_DIR=<dir with onigurumaConfig.cmake>
+cmake --build <qsp-5.9.5>/build
+# (Some package managers ship oniguruma with a .pc file and no CMake package
+#  config; that directory can then be a three-line shim pointing at the prefix.)
+
+# 2. build the headless driver
+QSP_SRC=<qsp-5.9.5> native-check/build.sh
+
+# 3. run the gate over your own saves
+node native-check/gate.js --corpus <folder of classic .sav> --qsp <game.qsp>
+```
+
+The gate converts every classic save in the folder with `target: '5.9.5'`,
+feeds it to the driver and asserts that the engine OPENS it and that every
+listed variable equals what `lib/legacy-sav.js` reads out of the classic
+original. It then feeds one **5.9.0** output to the same driver and requires a
+refusal. Without a driver binary it prints one line and SKIPs. The variable list
+at the top of `gate.js` is Girl Life's; edit it for another game. Binaries and
+converted output land in `native-check/build/`, which is gitignored, and no save
+is ever copied into this repository.
+
+Two things the driver had to get right, both of which read as "the converter is
+broken" until they are:
+
+* it must **UPPERCASE a variable name** before asking for it.
+  `qspVarReference` compares a name verbatim (`variables.c:376-393`), and the
+  engine only ever hands it names its own parser already uppercased — so a host
+  that asks for `money` finds nothing at all;
+* it must read the values **before the game's own ONGLOAD runs**, from inside
+  the `INITGAME` callback (`game.c:653`). `qspOpenGameStatus` ends by executing
+  ONGLOAD (`game.c:656`), and a game whose ONGLOAD migrates saves (Girl Life's
+  calls `saveupdater`) deliberately rewrites state there — on every save tried
+  it resets one NPC counter to 0. That is the game's business; the layout's
+  business is what the engine held a moment earlier.
 
 ## Why the codecs are hand-written
 

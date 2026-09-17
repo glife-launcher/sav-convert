@@ -30,6 +30,8 @@
                padding: 12px 16px; margin: 16px 0; font-size: 14px; }
   #direction strong { color: var(--accent); }
   label.opt { display: block; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  label.opt select { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel);
+                     border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
   button { font: inherit; padding: 10px 20px; border-radius: 8px; border: 1px solid var(--line);
            background: var(--accent); color: #fff; cursor: pointer; }
   button[disabled] { opacity: .45; cursor: default; }
@@ -121,10 +123,103 @@
 
   var CODREMOV = 5;
   var NEG_CODREMOV = (-CODREMOV) & 0xffff;
-  var VARSBUCKETS = 1024;          // libqsp variables.h:26
-  var VARSMAXBUCKETSIZE = 50;      // libqsp variables.h:27
+  var VARSBUCKETS = 1024;          // libqsp 5.9.0 variables.h:26
+  var VARSMAXBUCKETSIZE = 50;      // libqsp 5.9.0 variables.h:27
   var VARSSEEK = 50;               // qsp-legacy variables.h:24
   var VARSCOUNT = 256 * VARSSEEK;  // qsp-legacy variables.h:25 (12800)
+
+  /**
+   * THE MODERN TARGETS (WP-242, B-369).
+   *
+   * libqsp changed its save layout between 5.9.0 (what qspider and therefore
+   * the launcher run) and 5.9.5 (what the game's developers are building their
+   * new Qqsp on). The two are mutually unreadable — 5.9.5's `QSP_GAMEMIN_VER`
+   * is "5.9.4", so it refuses a 5.9.0-stamped file before it looks at anything
+   * else — so the converter has to be told which one it is writing.
+   *
+   * Everything below is transcribed from the two trees, never from a summary:
+   * 5.9.0 = QSPFoundation/qsp @ 9f4f29f9, 5.9.5 = tag 5.9.5 (0445921b).
+   *
+   *   field            5.9.0                          5.9.5
+   *   ver / gameMin    CMakeLists.txt:2 / :4          CMakeLists.txt:2 / :4
+   *   header           4 window FLAGS at 11..14       ONE bitmask at 11
+   *                    (game.c:313-316)               (game.c:328)
+   *   first body line  16 (game.c:403 ind = 16)       12 (game.c:415 ind = 12)
+   *   action fields    Image, Desc (game.c:327-328)   Desc, Image (game.c:340-341)
+   *   object fields    Image, Desc (game.c:341-342)   Name, Image (game.c:354-355)
+   *   object groups    -                              Name, Desc, Image,
+   *                                                   UpdatedFields, ObjsCount
+   *                                                   (game.c:357-364)
+   *   buckets          1024 (variables.h:26)          512 (variables.h:17)
+   *   max per bucket   50 (variables.h:27)            32 (variables.h:19)
+   *   hash             7, *31 + low byte              IDENTICAL
+   *                    (variables.c:112-115)          (variables.c:86-94)
+   *   qspCRC (line 3)  seed 0, signed >>, extra     seed ~0, logical >>, no
+   *                    ^0xD202EF8D (game.c:83-91)     extra xor, ~ on the way
+   *                                                   out (game.c:74-82)
+   *   type codes       TUPLE 0 NUM 1 STR 2            TUPLE 0 NUM 1 BOOL 2
+   *                    CODE 3 VARREF 4 UNDEF 5        STR 3 CODE 4 VARREF 5
+   *                    (bindings/qsp.h:87-92)         UNDEF 6 (bindings/qsp.h:82-88)
+   *
+   * Unchanged, and re-read to be sure: the container and the -5 shift
+   * (coding.c), the variant encoding itself (type line, then payload; a tuple
+   * is a count and that many nested variants — coding.c:340/363 in 5.9.5), the
+   * `$` prefix on a string index key (5.9.0 variant.h:25 QSP_IND_STRID,
+   * 5.9.5 declarations.h:63 QSP_STRTYPE, both written by
+   * qspAppendVariantToIndexString), and qspCRC.
+   */
+  var MODERN_TARGETS = {
+    '5.9.0': {
+      name: '5.9.0',
+      ver: '5.9.0',                 // CMakeLists.txt:2
+      gameMinVer: '5.9.0',          // CMakeLists.txt:4
+      buckets: 1024,                // variables.h:26
+      maxBucketSize: 50,            // variables.h:27
+      bodyStart: 16,                // game.c:403 `ind = 16`
+      timerLine: 15,                // the four window flags occupy 11..14
+      playlistLine: 16,
+      windowStateIsBitmask: false,  // game.c:313-316, four flags
+      actionDescFirst: false,       // game.c:327-328 Image, Desc
+      objectNameFirst: false,       // game.c:341-342 Image, Desc
+      hasObjsGroups: false,
+      definedTypes: 6,              // QSP_TYPE_DEFINED_TYPES, bindings/qsp.h:93
+      // index = the file's type code, value = its base type in 5.9.0 terms
+      baseType: [0, 1, 2, 2, 2, 2], // game.c:399 / qspBaseTypeTable
+      // the file's code for each CANONICAL type (see modern-sav.js)
+      code: { tuple: 0, num: 1, str: 2, code: 3, varref: 4, undef: 5 },
+      crc: 'qspCRC',      // game.c:83-91
+    },
+    '5.9.5': {
+      name: '5.9.5',
+      ver: '5.9.5',                 // CMakeLists.txt:2
+      gameMinVer: '5.9.4',          // CMakeLists.txt:4
+      buckets: 512,                 // variables.h:17 QSP_VARSGLOBALBUCKETS
+      maxBucketSize: 32,            // variables.h:19 QSP_MAXVARSBUCKETSIZE
+      bodyStart: 12,                // game.c:415 `ind = 12`
+      timerLine: 12,                // the walk itself reads the timer interval
+      playlistLine: 13,
+      windowStateIsBitmask: true,   // game.c:328 qspCurWindowsDisplayState
+      actionDescFirst: true,        // game.c:340-341 Desc, Image
+      objectNameFirst: true,        // game.c:354-355 Name, Image
+      hasObjsGroups: true,          // game.c:356-364
+      definedTypes: 7,              // bindings/qsp.h:89
+      // bindings/qsp.h:113-122 qspBaseTypeTable, expressed in 5.9.0 base codes:
+      // TUPLE, NUM, BOOL->NUM, STR, CODE->STR, VARREF->STR, UNDEF->STR
+      baseType: [0, 1, 1, 2, 2, 2, 2],
+      code: { tuple: 0, num: 1, str: 3, code: 4, varref: 5, undef: 6 },
+      crc: 'qspCRC595',   // game.c:74-82 — CRC-32B, a DIFFERENT number
+    },
+  };
+
+  /* bindings/qsp.h:44-50, both versions — the bits of qspCurWindowsDisplayState. */
+  var WIN_MAIN = 1, WIN_VARS = 2, WIN_ACTS = 4, WIN_OBJS = 8, WIN_INPUT = 16;
+
+  /** The spec for a target name, or null when the name is not one we write. */
+  function modernTarget(name) {
+    if (name === undefined || name === null || name === '') return MODERN_TARGETS['5.9.0'];
+    return Object.prototype.hasOwnProperty.call(MODERN_TARGETS, String(name))
+      ? MODERN_TARGETS[String(name)] : null;
+  }
 
   /** qspDecodeString: shift every code unit up by 5; -5 maps back to 5. */
   function decode(s) {
@@ -242,16 +337,42 @@
   }
 
   /**
-   * libqsp variables.c:113-115 — bucket = (7, then *31 + low byte of each code
-   * unit, unsigned 32-bit) % 1024. `(unsigned char)*pos` takes the LOW byte of
-   * the QSP_CHAR, so a non-ASCII name hashes on its low bytes; reproduced as-is.
+   * 5.9.5's qspCRC — a DIFFERENT number for the same bytes (WP-242).
+   *
+   * 5.9.0 `game.c:83-91` seeds `int crc = 0`, shifts a SIGNED int and folds an
+   * extra `^ 0xD202EF8D` into every step. 5.9.5 `game.c:74-82` is plain
+   * CRC-32B: `unsigned int crc = ~0`, a logical shift, no extra xor, and the
+   * result complemented on the way out. Same table, different answer — for
+   * Girl_Life_0.9.9.2.qsp, -651164383 against -2055507245.
+   *
+   * It matters: line 3 of a save is this number, and the engine compares it
+   * (game.c:421-424) unless the game has set DEBUG. Girl Life does set it, so
+   * a real player never sees the check — but a headless host that has not run
+   * the game's start code does, and a save carrying the other engine's CRC is
+   * refused with "Can't load file!" and nothing else to go on.
    */
-  function bucketOf(name) {
+  function qspCRC595(buf) {
+    var crc = 0xffffffff;
+    for (var i = 0; i < buf.length; i++) {
+      crc = ((CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8)) >>> 0);
+    }
+    return ~crc | 0;
+  }
+
+  /**
+   * libqsp variables.c:112-115 (5.9.0) / variables.c:86-94 (5.9.5, as
+   * `qspGetNameHash`) — bucket = (7, then *31 + low byte of each code unit,
+   * unsigned 32-bit) % the bucket count. The formula is IDENTICAL in both;
+   * only the modulus moved (1024 -> 512), so it is a parameter here.
+   * `(unsigned char)*pos` takes the LOW byte of the QSP_CHAR, so a non-ASCII
+   * name hashes on its low bytes; reproduced as-is.
+   */
+  function bucketOf(name, buckets) {
     var b = 7 >>> 0;
     for (var i = 0; i < name.length; i++) {
       b = (Math.imul(b, 31) + (name.charCodeAt(i) & 0xff)) >>> 0;
     }
-    return b % VARSBUCKETS;
+    return b % (buckets || VARSBUCKETS);
   }
 
   /**
@@ -396,6 +517,10 @@
     CODREMOV: CODREMOV,
     VARSBUCKETS: VARSBUCKETS,
     VARSMAXBUCKETSIZE: VARSMAXBUCKETSIZE,
+    MODERN_TARGETS: MODERN_TARGETS,
+    modernTarget: modernTarget,
+    WIN_MAIN: WIN_MAIN, WIN_VARS: WIN_VARS, WIN_ACTS: WIN_ACTS,
+    WIN_OBJS: WIN_OBJS, WIN_INPUT: WIN_INPUT,
     VARSSEEK: VARSSEEK,
     VARSCOUNT: VARSCOUNT,
     decode: decode,
@@ -403,6 +528,7 @@
     prepareForExecution: prepareForExecution,
     toNum: toNum,
     qspCRC: qspCRC,
+    qspCRC595: qspCRC595,
     bucketOf: bucketOf,
     legacyBlockOf: legacyBlockOf,
     isUcs2: isUcs2,
@@ -846,6 +972,10 @@
       bytes: buf.length,
       format: isOld ? 'qsp-old' : 'qsp',
       crc: qspCRC(buf),
+      // WP-242: libqsp 5.9.5 computes a DIFFERENT checksum over the same bytes
+      // (codec.qspCRC595), and line 3 of a save has to carry the one the
+      // engine that opens it will recompute.
+      crc595: codec.qspCRC595(buf),
       locations: locations,
       byUpper: byUpper,
     };
@@ -854,7 +984,14 @@
   return { readGameBuffer: readGameBuffer };
 }));
 
-// Rewrite a parsed legacy (5.7.0) save into a modern libqsp 5.9.0 save.
+// Rewrite a parsed legacy (5.7.0) save into a modern libqsp save — 5.9.0 by
+// default, 5.9.5 on request (WP-242 / B-369: the game's developers are porting
+// this converter into a new Qqsp built on 5.9.5, and the two modern layouts are
+// mutually unreadable — 5.9.5's QSP_GAMEMIN_VER is "5.9.4").
+//
+// Everything the two modern targets disagree about lives in ONE table,
+// `codec.MODERN_TARGETS`, transcribed from both trees with file:line; this file
+// only reads it. The 5.9.0 path is untouched and still produces the same bytes.
 //
 // Writer transcribed from libqsp @ 9f4f29f9 `qsp/game.c:274 qspSaveGameStatus`
 // and validated against `qsp/game.c:399 qspCheckGameStatus`, which refuses the
@@ -938,22 +1075,30 @@
   var prepareForExecution = codec.prepareForExecution;
   var bucketOf = codec.bucketOf;
   var writeContainer = codec.writeContainer;
-  var VARSBUCKETS = codec.VARSBUCKETS;
-  var VARSMAXBUCKETSIZE = codec.VARSMAXBUCKETSIZE;
   var ConvertError = errors.ConvertError;
 
   var QSP_VER = '5.9.0';            // libqsp CMakeLists.txt:2 -> QSP_VER_STR
   var SAVEDGAMEID = 'QSPSAVEDGAME'; // libqsp game.h:27
-  var T_NUM = 1, T_STR = 2, T_UNDEF = 5; // libqsp bindings/qsp.h:87-92
 
   /**
    * @param parsed  result of legacy-sav.parseLegacySav
    * @param game    result of qsp-game.readGame (the .qsp to target)
+   * @param opts.target  '5.9.0' (default) or '5.9.5'
    * @returns { buffer, report }
    */
-  function toModern(parsed, game) {
+  function toModern(parsed, game, opts) {
     const h = parsed.header;
     const notes = [];
+    const spec = codec.modernTarget(opts && opts.target);
+    if (!spec) {
+      throw new ConvertError('unknown modern target "' + (opts && opts.target) +
+        '" — this converter writes 5.9.0 or 5.9.5');
+    }
+    const VARSBUCKETS = spec.buckets;
+    const VARSMAXBUCKETSIZE = spec.maxBucketSize;
+    // The type codes SHIFTED in 5.9.5 (BOOL was inserted at 2), so every value
+    // this writer emits takes its code from the target, never a constant.
+    const T_NUM = spec.code.num, T_STR = spec.code.str, T_UNDEF = spec.code.undef;
 
     // ---- 1. location -------------------------------------------------------
     let location;
@@ -1077,7 +1222,7 @@
         else if (val.type === T_STR) strValues++;
         else undefValues++;
       }
-      buckets[bucketOf(v.name)].push({ name: v.name, values, indices });
+      buckets[bucketOf(v.name, VARSBUCKETS)].push({ name: v.name, values, indices });
     }
 
     const overfull = [];
@@ -1104,8 +1249,11 @@
     const num = (n) => out.push(encode(String(n)));
 
     plain(SAVEDGAMEID);
-    plain(QSP_VER);
-    num(game.crc);
+    plain(spec.ver);
+    // Line 3 is the target engine's OWN checksum of the .qsp — the two modern
+    // engines compute different ones over the same bytes (codec.qspCRC595).
+    const outCRC = spec.crc === 'qspCRC595' ? game.crc595 : game.crc;
+    num(outCRC);
     num(h.gameTime);
     num(selAction);
     num(selObject);
@@ -1114,10 +1262,23 @@
     enc(h.curDesc);
     enc(h.curVars);
     enc(location);
-    num(h.showActs);
-    num(h.showObjs);
-    num(h.showVars);
-    num(h.showInput);
+    if (spec.windowStateIsBitmask) {
+      // 5.9.5 game.c:328 — the four booleans became one bitmask,
+      // qspCurWindowsDisplayState (bindings/qsp.h:44-50). MAIN is always on and
+      // VIEW is always off, which is exactly the set a fresh game starts with
+      // (5.9.5 game.c:145 / common.c:61) and the closest thing to "the classic
+      // save said nothing about these two".
+      num(codec.WIN_MAIN |
+        (h.showVars ? codec.WIN_VARS : 0) |
+        (h.showActs ? codec.WIN_ACTS : 0) |
+        (h.showObjs ? codec.WIN_OBJS : 0) |
+        (h.showInput ? codec.WIN_INPUT : 0));
+    } else {
+      num(h.showActs);
+      num(h.showObjs);
+      num(h.showVars);
+      num(h.showInput);
+    }
     num(h.timerInterval);
     num(parsed.playlist.length);
     for (const f of parsed.playlist) enc(f);
@@ -1125,8 +1286,9 @@
     for (const f of parsed.includes) enc(f);
     num(parsed.actions.length);
     for (const a of parsed.actions) {
-      enc(a.image);
-      enc(a.desc);
+      // 5.9.0 game.c:327-328 writes Image then Desc; 5.9.5 game.c:340-341
+      // swapped them.
+      if (spec.actionDescFirst) { enc(a.desc); enc(a.image); } else { enc(a.image); enc(a.desc); }
       num(a.code.length);
       for (const [line, lineNum] of a.code) {
         const ready = prepareForExecution(line);
@@ -1141,7 +1303,18 @@
       // a.startLine / a.isManageLines are legacy-only and have no modern field
     }
     num(parsed.objects.length);
-    for (const o of parsed.objects) { enc(o.image); enc(o.desc); }
+    // 5.9.0 game.c:341-342 stores an object as Image + Desc; 5.9.5
+    // game.c:354-355 stores it as Name + Image (objects.h:16-19 — the struct
+    // lost its Desc member), so the classic Desc becomes the Name.
+    for (const o of parsed.objects) {
+      if (spec.objectNameFirst) { enc(o.desc); enc(o.image); } else { enc(o.image); enc(o.desc); }
+    }
+    if (spec.hasObjsGroups) {
+      // 5.9.5 game.c:356-364 — a section the 5.9.0 layout does not have.
+      // A classic save carries no groups, so it is written empty; the count
+      // itself is mandatory, and leaving it out shifts every line after it.
+      num(0);
+    }
     for (let b = 0; b < VARSBUCKETS; b++) {
       const bucket = buckets[b];
       num(bucket.length);
@@ -1176,7 +1349,8 @@
       buffer: writeContainer(out, h.ucs2),
       report: {
         engineVersionIn: h.engineVersion,
-        engineVersionOut: QSP_VER,
+        engineVersionOut: spec.ver,
+        target: spec.name,
         ucs2: h.ucs2,
         location,
         locationSource,
@@ -1186,7 +1360,7 @@
         // question — `lib/` never touches a filesystem.
         mods: parsed.includes.slice(),
         qstCRCIn: h.qstCRC,
-        qstCRCOut: game.crc,
+        qstCRCOut: outCRC,
         gameFile: game.file,
         gameLocations: game.locations.length,
         gameTime: h.gameTime,
@@ -1245,8 +1419,11 @@
 }));
 
 // A line-for-line reimplementation of libqsp's own acceptance gate,
-// `qsp/game.c:399 qspCheckGameStatus` (@ 9f4f29f9), plus the container checks
-// `qspOpenGameStatus` does before calling it.
+// `qsp/game.c:399 qspCheckGameStatus` (5.9.0 @ 9f4f29f9) and `game.c:411`
+// (5.9.5 @ tag 5.9.5), plus the container checks `qspOpenGameStatus` does
+// before calling it. One walk, driven by `codec.MODERN_TARGETS` — the two
+// versions differ in where the body starts, in the object/group sections and
+// in the bucket bounds, not in the shape of the walk.
 //
 // The converter runs this over its OWN OUTPUT before that output is put in
 // place. If this says no, the engine would have said "Error code: 14" at load
@@ -1274,39 +1451,44 @@
   var decode = codec.decode;
   var toNum = codec.toNum;
   var readContainer = codec.readContainer;
-  var VARSBUCKETS = codec.VARSBUCKETS;
-  var VARSMAXBUCKETSIZE = codec.VARSMAXBUCKETSIZE;
-
-  var GAMEMINVER = '5.9.0'; // libqsp CMakeLists.txt:4
-  var VER = '5.9.0';        // libqsp CMakeLists.txt:2
   var MAXPLFILES = 500, MAXINCFILES = 100, MAXACTIONS = 50, MAXOBJECTS = 1000;
-  var TYPES = 6;            // QSP_TYPE_DEFINED_TYPES (bindings/qsp.h:93)
   var BASE_TUPLE = 0, BASE_NUM = 1, BASE_STR = 2;
-  var BASETYPE = [BASE_TUPLE, BASE_NUM, BASE_STR, BASE_STR, BASE_STR, BASE_STR];
 
   /**
+   * @param input   the finished save's bytes
+   * @param target  '5.9.0' (default) or '5.9.5'
    * @returns { ok: true } or { ok: false, reason: string }
    */
-  function checkModernSav(input) {
+  function checkModernSav(input, target) {
+    const spec = codec.modernTarget(target);
+    if (!spec) return { ok: false, reason: 'unknown modern target ' + JSON.stringify(target) };
+    const VARSBUCKETS = spec.buckets;
+    const VARSMAXBUCKETSIZE = spec.maxBucketSize;
+    const TYPES = spec.definedTypes;   // QSP_TYPE_DEFINED_TYPES
+    const BASETYPE = spec.baseType;    // qspBaseTypeTable, in 5.9.0 base codes
     const buf = codec.toBytes(input);
     if (!buf) return { ok: false, reason: 'the save was not handed over as bytes' };
     const { lines } = readContainer(buf);
     const n = lines.length;
     const bad = (reason) => ({ ok: false, reason });
 
-    let ind = 16;
-    if (ind >= n) return bad('fewer than 17 lines');
+    // 5.9.0 game.c:403 opens the walk at line 16 — the four window flags sit at
+    // 11..14 and the timer interval at 15, all read by absolute index. 5.9.5
+    // game.c:415 opens it at 12, because those four became the single bitmask
+    // on line 11 and the timer interval is the walk's own first read.
+    let ind = spec.bodyStart;
+    if (ind >= n) return bad('fewer than ' + (spec.bodyStart + 1) + ' lines');
     if (lines[0] !== 'QSPSAVEDGAME') return bad('line 1 is not QSPSAVEDGAME');
-    // qspStrsComp is a plain lexicographic compare (text.h:241)
-    if (!(lines[1] >= GAMEMINVER)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts below ' + GAMEMINVER);
-    if (!(lines[1] <= VER)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts above ' + VER);
+    // qspStrsComp / qspStrsCompare is a plain lexicographic compare (text.h:241)
+    if (!(lines[1] >= spec.gameMinVer)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts below ' + spec.gameMinVer);
+    if (!(lines[1] <= spec.ver)) return bad('engine stamp ' + JSON.stringify(lines[1]) + ' sorts above ' + spec.ver);
     // The CRC test (game.c:408) is skipped by the engine whenever the game's
     // DEBUG variable is non-zero, which Girl Life sets in start.qsrc:8, so it is
     // not asserted here — but the converter still writes the correct value.
     const num = (k) => toNum(decode(lines[k]));
     const selAction = num(4);
     const selObject = num(5);
-    if (num(15) < 0) return bad('negative timer interval');
+    if (num(spec.timerLine) < 0) return bad('negative timer interval');
 
     const take = () => {
       if (ind >= n) return null;
@@ -1314,6 +1496,7 @@
     };
     const skip = (k) => { ind += k; return ind < n; };
 
+    ind = spec.playlistLine;
     let count = take();
     if (count === null || !skip(0)) return bad('truncated at the playlist count');
     if (count < 0 || count > MAXPLFILES) return bad('playlist count ' + count);
@@ -1350,6 +1533,22 @@
     if (count < 0 || count > MAXOBJECTS) return bad('objects count ' + count);
     if (selObject >= count) return bad('selected object ' + selObject + ' >= ' + count + ' objects');
     if (!skip(2 * count)) return bad('truncated inside the objects');
+
+    if (spec.hasObjsGroups) {
+      // 5.9.5 game.c:471-485 — a section 5.9.0 does not have at all.
+      count = take();
+      if (count === null) return bad('truncated at the object-groups count');
+      if (count < 0 || count > MAXOBJECTS) return bad('object-groups count ' + count);
+      for (let i = 0; i < count; i++) {
+        if (!skip(3)) return bad('truncated in object group ' + i + ' header');
+        const updated = take();
+        if (updated === null) return bad('truncated at object group ' + i + ' updated fields');
+        if (updated < 0) return bad('negative updated fields in object group ' + i);
+        const objs = take();
+        if (objs === null) return bad('truncated at object group ' + i + ' objects count');
+        if (objs < 0 || objs > MAXOBJECTS) return bad('object group ' + i + ' holds ' + objs + ' objects');
+      }
+    }
 
     const readVariant = () => {
       if (ind >= n) return { ok: false };
@@ -1405,8 +1604,25 @@
   return { checkModernSav: checkModernSav };
 }));
 
-// Strict reader for a MODERN libqsp `.sav` (engine stamp 5.9.0) — the mirror
-// image of `legacy-sav.js`, and the front half of the REVERSE converter.
+// Strict reader for a MODERN libqsp `.sav` — the mirror image of
+// `legacy-sav.js`, and the front half of the REVERSE converter.
+//
+// It reads BOTH modern layouts (WP-242): 5.9.0, and 5.9.5, which moved the
+// window flags, the action and object fields, added an object-groups section,
+// halved the bucket count and SHIFTED every value type code. The layout is
+// chosen by the engine stamp on line 2 — the same field the engine itself
+// gates on — and the result is NORMALISED to one shape, so everything
+// downstream (reverse.js above all) sees one format:
+//
+//   * `header.showActs/showObjs/showVars/showInput` are booleans-as-ints
+//     either way; a 5.9.5 file also keeps its raw `windowsDisplayState`;
+//   * an action and an object always read `{image, desc}`, whatever order the
+//     file stored them in (a 5.9.5 object's `Name` IS its displayed text, so
+//     it lands in `desc`, and is also kept as `name`);
+//   * a value's `type` is always the 5.9.0 code (TUPLE 0, NUM 1, STR 2,
+//     CODE 3, VARREF 4, UNDEF 5). 5.9.5's BOOL (2) has no 5.9.0 spelling and
+//     is a number underneath (bindings/qsp.h:117), so it reads as NUM with
+//     `bool: true`; `rawType` keeps the code the file actually carried.
 //
 // Layout transcribed from libqsp @ 9f4f29f9 `qsp/game.c:274
 // (qspSaveGameStatus)` and its own acceptance gate at `:399`:
@@ -1452,13 +1668,35 @@
 
   var decode = codec.decode;
   var SavFormatError = errors.SavFormatError;
-  var VARSBUCKETS = codec.VARSBUCKETS;
-  var VARSMAXBUCKETSIZE = codec.VARSMAXBUCKETSIZE;
-
   var T_TUPLE = 0, T_NUM = 1, T_STR = 2, T_CODE = 3, T_VARREF = 4, T_UNDEF = 5;
   var TYPE_NAME = ['tuple', 'number', 'string', 'code', 'variable reference', 'unset'];
-  // game.c:399 BASETYPE — which branch of the writer each type went through
-  var BASETYPE = [T_TUPLE, T_NUM, T_STR, T_STR, T_STR, T_STR];
+
+  /**
+   * Numeric dotted-version compare. NOT the engine's own raw string compare:
+   * under that one "5.10.0" would sort below "5.9.4" and a future save would
+   * be read with the wrong layout. Same reasoning as index.js.
+   */
+  function atLeast(stamp, floor) {
+    var a = String(stamp).split('.'), b = String(floor).split('.'), i, x, y;
+    for (i = 0; i < Math.max(a.length, b.length); i++) {
+      x = parseInt(a[i], 10); y = parseInt(b[i], 10);
+      if (isNaN(x)) x = 0;
+      if (isNaN(y)) y = 0;
+      if (x !== y) return x > y;
+    }
+    return true;
+  }
+
+  /** A file type code -> the canonical (5.9.0) one, per target. */
+  function canonicalType(spec, type) {
+    var k;
+    for (k in spec.code) {
+      if (Object.prototype.hasOwnProperty.call(spec.code, k) && spec.code[k] === type) {
+        return { tuple: T_TUPLE, num: T_NUM, str: T_STR, code: T_CODE, varref: T_VARREF, undef: T_UNDEF }[k];
+      }
+    }
+    return T_NUM; // 5.9.5's BOOL — a number underneath (bindings/qsp.h:117)
+  }
 
   function parseModernSav(input) {
     var buf = codec.toBytes(input);
@@ -1473,6 +1711,12 @@
         JSON.stringify(String(lines[0]).slice(0, 32)) + ', expected "QSPSAVEDGAME"');
     }
     var engineVersion = lines[1];
+    // The engine gates on this same field, so it is what picks the layout:
+    // 5.9.5's QSP_GAMEMIN_VER is "5.9.4" (CMakeLists.txt:4), i.e. anything
+    // stamped 5.9.4 or above is the new layout.
+    var spec = codec.modernTarget(atLeast(engineVersion, '5.9.4') ? '5.9.5' : '5.9.0');
+    var VARSBUCKETS = spec.buckets;
+    var VARSMAXBUCKETSIZE = spec.maxBucketSize;
     if (lines.length < 18) {
       throw new SavFormatError('QSP save header, but only ' + lines.length +
         ' lines — the file is truncated before the body');
@@ -1492,7 +1736,7 @@
       var text = str();
       if (!/^-?\d+$/.test(text)) {
         throw new SavFormatError('expected ' + what + ' (a number) on line ' + at +
-          ', found ' + JSON.stringify(text.slice(0, 32)) + ' — this is not a 5.9.0 save body');
+          ', found ' + JSON.stringify(text.slice(0, 32)) + ' — this is not a ' + spec.ver + ' save body');
       }
       return parseInt(text, 10);
     };
@@ -1523,10 +1767,22 @@
     };
     // Modern always stores the location NAME (game.c:300) — never an ordinal.
     head.location = str();
-    head.showActs = int('the actions-window flag');
-    head.showObjs = int('the objects-window flag');
-    head.showVars = int('the stats-window flag');
-    head.showInput = int('the input-window flag');
+    head.target = spec.name;
+    if (spec.windowStateIsBitmask) {
+      // 5.9.5 game.c:551 — one qspCurWindowsDisplayState int, bits in
+      // bindings/qsp.h:44-50.
+      var winState = int('the windows display state');
+      head.windowsDisplayState = winState;
+      head.showActs = (winState & codec.WIN_ACTS) ? 1 : 0;
+      head.showObjs = (winState & codec.WIN_OBJS) ? 1 : 0;
+      head.showVars = (winState & codec.WIN_VARS) ? 1 : 0;
+      head.showInput = (winState & codec.WIN_INPUT) ? 1 : 0;
+    } else {
+      head.showActs = int('the actions-window flag');
+      head.showObjs = int('the objects-window flag');
+      head.showVars = int('the stats-window flag');
+      head.showInput = int('the input-window flag');
+    }
     head.timerInterval = int('the timer interval');
 
     var k, l, v;
@@ -1541,8 +1797,9 @@
     var actions = [];
     var actsCount = count('the actions count', 50);    // QSP_MAXACTIONS
     for (k = 0; k < actsCount; k++) {
-      var image = str();
-      var desc = str();
+      // 5.9.0 game.c:327-328 Image, Desc; 5.9.5 game.c:340-341 Desc, Image.
+      var image, desc;
+      if (spec.actionDescFirst) { desc = str(); image = str(); } else { image = str(); desc = str(); }
       var linesCount = count('an action code length', lines.length);
       var code = [];
       for (l = 0; l < linesCount; l++) code.push([str(), int('an action line number')]);
@@ -1557,24 +1814,53 @@
 
     var objects = [];
     var objsCount = count('the objects count', 1000);  // QSP_MAXOBJECTS
-    for (k = 0; k < objsCount; k++) objects.push({ image: str(), desc: str() });
+    for (k = 0; k < objsCount; k++) {
+      // 5.9.5 game.c:354-355 stores Name + Image; its Name is the displayed
+      // text (objects.h:16-19 has no Desc member any more), so it is what a
+      // 5.9.0 reader calls `desc`.
+      if (spec.objectNameFirst) {
+        var oname = str();
+        objects.push({ name: oname, desc: oname, image: str() });
+      } else {
+        objects.push({ image: str(), desc: str() });
+      }
+    }
+
+    var objsGroups = [];
+    if (spec.hasObjsGroups) {
+      // 5.9.5 game.c:586-594 — absent from 5.9.0 entirely.
+      var groupsCount = count('the object-groups count', 1000);
+      for (k = 0; k < groupsCount; k++) {
+        objsGroups.push({
+          name: str(), desc: str(), image: str(),
+          updatedFields: int('an object group updated-fields mask'),
+          objsCount: int('an object group objects count'),
+        });
+      }
+    }
 
     /** One variant: {type, num} | {type, str} | {type: 0, items: [...]}. */
     function readVariant(varName) {
       var at = i + 1;
       var type = int('a value type');
-      if (type < 0 || type >= BASETYPE.length) {
+      if (type < 0 || type >= spec.baseType.length) {
         throw new SavFormatError('variable ' + varName + ' has a value of unknown type ' + type +
-          ' on line ' + at + ' — this is not a 5.9.0 save body');
+          ' on line ' + at + ' — this is not a ' + spec.ver + ' save body');
       }
-      if (BASETYPE[type] === T_TUPLE) {
+      var canon = canonicalType(spec, type);
+      var extra = (canon === T_NUM && type !== spec.code.num) ? { bool: true } : null;
+      if (spec.baseType[type] === T_TUPLE) {
         var items = count('a tuple length', lines.length);
         var vals = [];
         for (var t = 0; t < items; t++) vals.push(readVariant(varName));
-        return { type: type, items: vals };
+        return { type: canon, rawType: type, items: vals };
       }
-      if (BASETYPE[type] === T_NUM) return { type: type, num: int('a variable number') };
-      return { type: type, str: str() };
+      if (spec.baseType[type] === T_NUM) {
+        var vnum = { type: canon, rawType: type, num: int('a variable number') };
+        if (extra) vnum.bool = true;
+        return vnum;
+      }
+      return { type: canon, rawType: type, str: str() };
     }
 
     var vars = [];
@@ -1597,14 +1883,15 @@
     // game.c:488 — the body ends exactly on the trailing empty line, and
     // game.c:493 refuses the file when it does not.
     if (i !== lines.length - 1 || lines[lines.length - 1] !== '') {
-      throw new SavFormatError('the body does not end where a 5.9.0 save should ' +
+      throw new SavFormatError('the body does not end where a ' + spec.ver + ' save should ' +
         '(stopped at line ' + i + ' of ' + lines.length + ') — the file is corrupt or ' +
         'was written by a player this converter does not know');
     }
 
     return {
       header: head, playlist: playlist, includes: includes,
-      actions: actions, objects: objects, vars: vars, buckets: buckets,
+      actions: actions, objects: objects, objsGroups: objsGroups,
+      vars: vars, buckets: buckets, target: spec.name,
     };
   }
 
@@ -1974,6 +2261,7 @@
       buffer: writeContainer(out, h.ucs2),
       report: {
         engineVersionIn: h.engineVersion,
+        target: h.target,   // which modern layout the input was in (WP-242)
         engineVersionOut: LEGACY_VER,
         ucs2: h.ucs2,
         location,
@@ -2145,7 +2433,8 @@
 
 // The converter's public entry points: bytes in, bytes out, one per direction.
 //
-//   convertBuffer({ savBytes, qspBytes, qspName })        classic -> modern
+//   convertBuffer({ savBytes, qspBytes, qspName,          classic -> modern
+//                   target })                             (target: WP-242)
 //   reverseConvertBuffer({ savBytes, qspBytes, qspName,   modern  -> classic
 //                          locationAs })                  (WP-63)
 //
@@ -2196,6 +2485,7 @@
   'use strict';
 
   var MODERN_VER = '5.9.0';
+  var DEFAULT_TARGET = '5.9.0';
 
   /** Engine stamp from a QSP save, or null if the file is not one at all. */
   function readEngineStamp(bytes) {
@@ -2232,10 +2522,21 @@
    * @param opts.qspBytes  the target game file's bytes
    * @param opts.qspName   what to call the game file in messages (a path or a
    *                       file name — never read, only printed)
+   * @param opts.target    which modern engine to write for: '5.9.0' (default,
+   *                       what qspider and therefore the launcher run) or
+   *                       '5.9.5' (the new Qqsp — WP-242 / B-369). The two are
+   *                       mutually unreadable: 5.9.5 refuses a 5.9.0-stamped
+   *                       save outright, because its QSP_GAMEMIN_VER is 5.9.4.
    * @returns { outBytes: Uint8Array, report }
    */
   function convertBuffer(opts) {
     var o = opts || {};
+    var target = o.target === undefined || o.target === null || o.target === ''
+      ? DEFAULT_TARGET : String(o.target);
+    if (!codec.modernTarget(target)) {
+      throw new errors.ConvertError('unknown target engine "' + target +
+        '" — this converter writes 5.9.0 (default) or 5.9.5.');
+    }
     var savBytes = codec.toBytes(o.savBytes);
     if (!savBytes) throw new errors.SavFormatError('the save was not handed over as bytes');
 
@@ -2250,15 +2551,15 @@
 
     var parsed = legacySav.parseLegacySav(savBytes);
     var game = qspGame.readGameBuffer(o.qspBytes, o.qspName);
-    var written = convert.toModern(parsed, game);
+    var written = convert.toModern(parsed, game, { target: target });
 
-    var gate = modernCheck.checkModernSav(written.buffer);
+    var gate = modernCheck.checkModernSav(written.buffer, target);
     if (!gate.ok) {
       throw new errors.ConvertError('the converted save would be rejected by the game engine (' +
         gate.reason + '). Nothing was written. Please report this file — it is a converter bug.');
     }
 
-    var report = { inputBytes: savBytes.length, outputBytes: written.buffer.length };
+    var report = { inputBytes: savBytes.length, outputBytes: written.buffer.length, target: target };
     for (var k in written.report) {
       if (Object.prototype.hasOwnProperty.call(written.report, k)) report[k] = written.report[k];
     }
@@ -2267,6 +2568,9 @@
 
   /**
    * Convert one MODERN save back to the classic format (WP-63).
+   *
+   * Reads BOTH modern layouts: which one a file is in comes off its own engine
+   * stamp, exactly as the engine decides it (modern-sav.js).
    *
    * The mirror of `convertBuffer`, same shape, same discipline: bytes in,
    * bytes out, typed refusals, and the destination engine's OWN acceptance
@@ -2322,6 +2626,8 @@
   return {
     convertBuffer: convertBuffer,
     reverseConvertBuffer: reverseConvertBuffer,
+    MODERN_TARGETS: Object.keys(codec.MODERN_TARGETS),
+    DEFAULT_TARGET: DEFAULT_TARGET,
     readEngineStamp: readEngineStamp,
     compareVersions: compareVersions,
     MODERN_VER: MODERN_VER,
@@ -2349,6 +2655,8 @@ self.onmessage = function (e) {
       req.locationAs = m.locationAs;
       out = api.reverseConvertBuffer(req);
     } else {
+      // Which modern engine to write for; absent means the 5.9.0 default.
+      if (m.target) req.target = m.target;
       out = api.convertBuffer(req);
     }
     var buf = out.outBytes.buffer.byteLength === out.outBytes.byteLength
@@ -2420,6 +2728,16 @@ self.onmessage = function (e) {
       : 'This save was written by engine <strong>' + stamp + '</strong> (modern). ' +
         'It will be converted to the <strong>classic 5.7.0</strong> format.';
     elDir.innerHTML = html;
+    if (dir === 'forward') {
+      // The two modern engines are mutually unreadable, so the player the save
+      // is going to has to be named. 5.9.0 first, and therefore the default.
+      var tlab = document.createElement('label');
+      tlab.className = 'opt';
+      tlab.innerHTML = 'Modern player: <select id="target">' +
+        '<option value="5.9.0">qSpider / launcher (5.9.0)</option>' +
+        '<option value="5.9.5">the new Qqsp (libqsp 5.9.5)</option></select>';
+      elDir.appendChild(tlab);
+    }
     if (dir === 'reverse') {
       var lab = document.createElement('label');
       lab.className = 'opt';
@@ -2531,6 +2849,10 @@ self.onmessage = function (e) {
     say('Reading the game file …');
     var locBox = document.getElementById('locidx');
     var locationAs = (dir === 'reverse' && locBox && locBox.checked) ? 'index' : 'name';
+    // The reverse direction needs no such choice: the layout of a modern save
+    // comes off its own engine stamp.
+    var tgtBox = document.getElementById('target');
+    var target = (dir === 'forward' && tgtBox) ? tgtBox.value : null;
 
     qspFile.arrayBuffer().then(function (qspBuf) {
       say('Converting …');
@@ -2540,7 +2862,8 @@ self.onmessage = function (e) {
         savBytes: savBytes.buffer.slice(0),
         qspBytes: qspBuf,
         qspName: qspFile.name,
-        locationAs: locationAs
+        locationAs: locationAs,
+        target: target
       };
       if (w) {
         window.__glPath = 'worker';
